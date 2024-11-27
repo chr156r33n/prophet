@@ -5,6 +5,7 @@ import pandas as pd
 from plotly.io import write_image
 import zipfile
 import io
+import plotly.express as px
 
 # Streamlit app configuration
 st.set_page_config(page_title="Prophet Forecasting App", layout="wide")
@@ -107,6 +108,21 @@ if uploaded_file:
                             st.write("Forecast Matrix (Monthly by Year):")
                             st.dataframe(forecast_matrix)
 
+                            # Plot year-on-year comparison
+                            st.write("Year-on-Year Comparison Line Chart:")
+                            melted_forecast = forecast_matrix.reset_index().melt(
+                                id_vars="month", var_name="year", value_name="value"
+                            )
+                            yoy_fig = px.line(
+                                melted_forecast,
+                                x="month",
+                                y="value",
+                                color="year",
+                                title="Year-on-Year Forecast Comparison",
+                                labels={"month": "Month", "value": "Metric"},
+                            )
+                            st.plotly_chart(yoy_fig)
+
                             # Plot forecast
                             st.write("Forecast Plot:")
                             forecast_fig = plot_plotly(model, forecast)
@@ -126,7 +142,17 @@ if uploaded_file:
                                 forecast.to_csv(forecast_csv, index=False)
                                 zf.writestr("forecast.csv", forecast_csv.getvalue())
 
-                                # Save plots as PNG
+                                # Save forecast matrix as CSV
+                                matrix_csv = io.StringIO()
+                                forecast_matrix.to_csv(matrix_csv, index=True)
+                                zf.writestr("forecast_matrix.csv", matrix_csv.getvalue())
+
+                                # Save year-on-year comparison plot
+                                yoy_buffer = io.BytesIO()
+                                write_image(yoy_fig, yoy_buffer, format="png")
+                                zf.writestr("yoy_comparison.png", yoy_buffer.getvalue())
+
+                                # Save forecast and decomposition plots as PNG
                                 for plot_name, plot_fig in zip(
                                     ["forecast", "components"], [forecast_fig, components_fig]
                                 ):
