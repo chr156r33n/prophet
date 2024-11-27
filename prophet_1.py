@@ -110,11 +110,11 @@ if uploaded_file:
 
                             # Plot year-on-year comparison
                             st.write("Year-on-Year Comparison Line Chart:")
-                            melted_forecast = forecast_matrix.reset_index().melt(
+                            yoy_data = forecast_matrix.iloc[:, :-1].reset_index().melt(
                                 id_vars="month", var_name="year", value_name="value"
                             )
                             yoy_fig = px.line(
-                                melted_forecast,
+                                yoy_data,
                                 x="month",
                                 y="value",
                                 color="year",
