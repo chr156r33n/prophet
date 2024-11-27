@@ -12,6 +12,13 @@ st.set_page_config(page_title="Prophet Forecasting App", layout="wide")
 # Title
 st.title("Prophet Forecasting App")
 
+# Helper function for date validation
+def validate_dates(date_series):
+    try:
+        return pd.to_datetime(date_series, errors="coerce")
+    except Exception as e:
+        return None
+
 # File Upload Section
 uploaded_file = st.file_uploader("Upload your CSV file (with 'date', 'metric', and optional regressors)", type=["csv"])
 
@@ -21,97 +28,121 @@ if uploaded_file:
         data = pd.read_csv(uploaded_file)
         st.write("Uploaded Data Preview:", data.head())
 
-        # Ensure correct structure
+        # Validate date column
         if len(data.columns) < 2:
             st.error("The file must have at least two columns: 'date' and 'metric'.")
         else:
-            # Identify columns
             date_col = data.columns[0]
             metric_col = data.columns[1]
             regressor_cols = data.columns[2:]
 
-            st.info(f"Date column: '{date_col}', Metric column: '{metric_col}'")
-            st.info(f"Regressors: {', '.join(regressor_cols)} (if any)")
-
-            # User input for forecast options
-            changepoint_prior_scale = st.slider("Changepoint Prior Scale", 0.0, 1.0, 0.5, 0.1)
-            seasonality_prior_scale = st.slider("Seasonality Prior Scale", 1.0, 20.0, 10.0, 0.5)
-            manual_changepoints = st.text_area(
-                "Manual Changepoints (comma-separated dates, e.g., 2024-01-01,2024-06-01)", ""
-            )
-
-            # Prepare data
-            data = data.rename(columns={date_col: "ds", metric_col: "y"})
+            # Remove commas from numbers and validate date format
+            data[date_col] = validate_dates(data[date_col])
+            data[metric_col] = data[metric_col].replace(",", "", regex=True).astype(float)
             for reg_col in regressor_cols:
-                data[reg_col] = data[reg_col]
+                data[reg_col] = data[reg_col].replace(",", "", regex=True).astype(float)
 
-            st.write("Processed Data for Forecasting:", data.head())
+            if data[date_col].isnull().any():
+                st.error(f"Invalid dates detected in column '{date_col}'. Ensure all dates are in a valid format.")
+            else:
+                st.info(f"Date column: '{date_col}', Metric column: '{metric_col}'")
+                st.info(f"Regressors: {', '.join(regressor_cols)} (if any)")
 
-            # Run Forecast Button
-            if st.button("Run Forecast"):
-                with st.spinner("Running the forecast..."):
-                    try:
-                        # Initialize Prophet model
-                        model = Prophet(
-                            changepoint_prior_scale=changepoint_prior_scale,
-                            seasonality_prior_scale=seasonality_prior_scale,
-                        )
+                # User input for forecast options
+                changepoint_prior_scale = st.slider("Changepoint Prior Scale", 0.0, 1.0, 0.5, 0.1)
+                seasonality_prior_scale = st.slider("Seasonality Prior Scale", 1.0, 20.0, 10.0, 0.5)
+                manual_changepoints = st.text_area(
+                    "Manual Changepoints (comma-separated dates, e.g., 2024-01-01,2024-06-01)", ""
+                )
 
-                        # Add regressors
-                        for reg_col in regressor_cols:
-                            model.add_regressor(reg_col)
+                # Prepare data
+                data = data.rename(columns={date_col: "ds", metric_col: "y"})
 
-                        # Add manual changepoints if provided
-                        if manual_changepoints.strip():
-                            changepoints = [cp.strip() for cp in manual_changepoints.split(",")]
-                            model.changepoints = pd.to_datetime(changepoints)
-                            st.write("Using manual changepoints:", changepoints)
+                st.write("Processed Data for Forecasting:", data.head())
 
-                        # Fit the model
-                        model.fit(data)
+                # Run Forecast Button
+                if st.button("Run Forecast"):
+                    with st.spinner("Running the forecast..."):
+                        try:
+                            # Initialize Prophet model
+                            model = Prophet(
+                                changepoint_prior_scale=changepoint_prior_scale,
+                                seasonality_prior_scale=seasonality_prior_scale,
+                            )
 
-                        # Create future dataframe
-                        future = model.make_future_dataframe(periods=0)
-                        for reg_col in regressor_cols:
-                            future[reg_col] = data[reg_col]
-                        forecast = model.predict(future)
+                            # Add regressors
+                            for reg_col in regressor_cols:
+                                model.add_regressor(reg_col)
 
-                        # Plot forecast
-                        st.write("Forecast Plot:")
-                        forecast_fig = plot_plotly(model, forecast)
-                        st.plotly_chart(forecast_fig)
+                            # Add manual changepoints if provided
+                            if manual_changepoints.strip():
+                                changepoints = [cp.strip() for cp in manual_changepoints.split(",")]
+                                model.changepoints = pd.to_datetime(changepoints)
+                                st.write("Using manual changepoints:", changepoints)
 
-                        # Plot components
-                        st.write("Decomposition Plot:")
-                        components_fig = plot_components_plotly(model, forecast)
-                        st.plotly_chart(components_fig)
+                            # Fit the model
+                            model.fit(data)
 
-                        # Prepare download
-                        st.write("Preparing download...")
-                        buffer = io.BytesIO()
-                        with zipfile.ZipFile(buffer, "w") as zf:
-                            # Save forecast as CSV
-                            forecast_csv = io.StringIO()
-                            forecast.to_csv(forecast_csv, index=False)
-                            zf.writestr("forecast.csv", forecast_csv.getvalue())
+                            # Create future dataframe
+                            future = model.make_future_dataframe(periods=0)
+                            for reg_col in regressor_cols:
+                                future[reg_col] = data[reg_col]
+                            forecast = model.predict(future)
 
-                            # Save plots as PNG
-                            for plot_name, plot_fig in zip(
-                                ["forecast", "components"], [forecast_fig, components_fig]
-                            ):
-                                img_buffer = io.BytesIO()
-                                write_image(plot_fig, img_buffer, format="png")
-                                zf.writestr(f"{plot_name}.png", img_buffer.getvalue())
+                            # Format forecast matrix
+                            forecast["year"] = forecast["ds"].dt.year
+                            forecast["month"] = forecast["ds"].dt.month
+                            forecast_matrix = forecast.pivot_table(
+                                index="month", columns="year", values="yhat", aggfunc="mean"
+                            ).round(2)
 
-                        buffer.seek(0)
-                        st.success("Forecasting complete! Download your results below.")
-                        st.download_button(
-                            "Download Results",
-                            data=buffer,
-                            file_name="forecast_results.zip",
-                            mime="application/zip",
-                        )
-                    except Exception as e:
-                        st.error(f"An error occurred during the forecast: {e}")
+                            # Add percentage change columns for forecast dates
+                            last_year = forecast_matrix.columns[-2]
+                            forecast_year = forecast_matrix.columns[-1]
+                            forecast_matrix["% Change"] = (
+                                (forecast_matrix[forecast_year] - forecast_matrix[last_year]) / forecast_matrix[last_year]
+                            ).round(4) * 100
+
+                            # Display forecast matrix
+                            st.write("Forecast Matrix (Monthly by Year):")
+                            st.dataframe(forecast_matrix)
+
+                            # Plot forecast
+                            st.write("Forecast Plot:")
+                            forecast_fig = plot_plotly(model, forecast)
+                            st.plotly_chart(forecast_fig)
+
+                            # Plot components
+                            st.write("Decomposition Plot:")
+                            components_fig = plot_components_plotly(model, forecast)
+                            st.plotly_chart(components_fig)
+
+                            # Prepare download
+                            st.write("Preparing download...")
+                            buffer = io.BytesIO()
+                            with zipfile.ZipFile(buffer, "w") as zf:
+                                # Save forecast as CSV
+                                forecast_csv = io.StringIO()
+                                forecast.to_csv(forecast_csv, index=False)
+                                zf.writestr("forecast.csv", forecast_csv.getvalue())
+
+                                # Save plots as PNG
+                                for plot_name, plot_fig in zip(
+                                    ["forecast", "components"], [forecast_fig, components_fig]
+                                ):
+                                    img_buffer = io.BytesIO()
+                                    write_image(plot_fig, img_buffer, format="png")
+                                    zf.writestr(f"{plot_name}.png", img_buffer.getvalue())
+
+                            buffer.seek(0)
+                            st.success("Forecasting complete! Download your results below.")
+                            st.download_button(
+                                "Download Results",
+                                data=buffer,
+                                file_name="forecast_results.zip",
+                                mime="application/zip",
+                            )
+                        except Exception as e:
+                            st.error(f"An error occurred during the forecast: {e}")
     except Exception as e:
         st.error(f"Failed to process the uploaded file: {e}")
