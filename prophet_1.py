@@ -90,19 +90,27 @@ if uploaded_file:
                                 future[reg_col] = data[reg_col]
                             forecast = model.predict(future)
 
+                            # Separate historical and forecast data
+                            historical_data = data[["ds", "y"]]
+                            forecast_data = forecast[["ds", "yhat"]]
+                            combined_data = pd.merge(historical_data, forecast_data, on="ds", how="outer")
+                            combined_data["final"] = combined_data["y"].combine_first(combined_data["yhat"])
+
                             # Format forecast matrix
-                            forecast["year"] = forecast["ds"].dt.year
-                            forecast["month"] = forecast["ds"].dt.month
-                            forecast_matrix = forecast.pivot_table(
-                                index="month", columns="year", values="yhat", aggfunc="mean"
+                            combined_data["year"] = combined_data["ds"].dt.year
+                            combined_data["month"] = combined_data["ds"].dt.month
+                            forecast_matrix = combined_data.pivot_table(
+                                index="month", columns="year", values="final", aggfunc="mean"
                             ).round(2)
 
                             # Add percentage change columns for forecast dates
-                            last_year = forecast_matrix.columns[-2]
-                            forecast_year = forecast_matrix.columns[-1]
-                            forecast_matrix["% Change"] = (
-                                (forecast_matrix[forecast_year] - forecast_matrix[last_year]) / forecast_matrix[last_year]
-                            ).round(4) * 100
+                            if len(forecast_matrix.columns) >= 2:
+                                last_year = forecast_matrix.columns[-2]
+                                forecast_year = forecast_matrix.columns[-1]
+                                forecast_matrix["% Change"] = (
+                                    (forecast_matrix[forecast_year] - forecast_matrix[last_year])
+                                    / forecast_matrix[last_year]
+                                ).round(4) * 100
 
                             # Display forecast matrix
                             st.write("Forecast Matrix (Monthly by Year):")
@@ -138,9 +146,9 @@ if uploaded_file:
                             buffer = io.BytesIO()
                             with zipfile.ZipFile(buffer, "w") as zf:
                                 # Save forecast as CSV
-                                forecast_csv = io.StringIO()
-                                forecast.to_csv(forecast_csv, index=False)
-                                zf.writestr("forecast.csv", forecast_csv.getvalue())
+                                combined_csv = io.StringIO()
+                                combined_data.to_csv(combined_csv, index=False)
+                                zf.writestr("combined_data.csv", combined_csv.getvalue())
 
                                 # Save forecast matrix as CSV
                                 matrix_csv = io.StringIO()
