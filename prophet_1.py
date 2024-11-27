@@ -81,6 +81,34 @@ if uploaded_file:
                                 model.changepoints = pd.to_datetime(changepoints)
                                 st.write("Using manual changepoints:", changepoints)
 
+                            # Frequency selection
+                            st.write("Specify the frequency of your data:")
+                            freq = st.selectbox(
+                                "Frequency", ["Infer Automatically", "Daily", "Weekly", "Monthly", "Yearly"], index=0
+                            )
+                            
+                            # Infer or validate frequency
+                            if freq == "Infer Automatically":
+                                inferred_freq = pd.infer_freq(data["ds"])
+                                if inferred_freq:
+                                    freq = inferred_freq
+                                    st.info(f"Inferred frequency: {freq}")
+                                else:
+                                    freq = "D"  # Default to daily
+                                    st.warning(
+                                        "Frequency could not be inferred automatically. Defaulting to 'Daily'."
+                                    )
+                            else:
+                                freq_map = {"Daily": "D", "Weekly": "W", "Monthly": "M", "Yearly": "Y"}
+                                freq = freq_map[freq]
+                            
+                            # Ensure regular intervals if frequency is specified
+                            if freq:
+                                data = data.set_index("ds").asfreq(freq).reset_index()
+                                st.write(f"Data resampled to {freq} frequency:")
+                                st.dataframe(data.head())
+
+
                             # Fit the model
                             model.fit(data)
 
