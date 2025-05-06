@@ -15,30 +15,38 @@ st.title("Prophet Forecasting App")
 
 with st.expander("How to use this app"):
     st.markdown("""
-    **Step 1.** Upload your CSV file  
-    • Must contain at least two columns:  
-      1. A `date` column (e.g. `YYYY-MM-DD`)  
-      2. A `metric` column (numeric)  
-      3. Optional additional regressor columns  
+    **Step 1. Upload your CSV file**  
+    • **Significance:** The quality of your input data drives the accuracy of any forecast.  
+    • **Impact:** Missing dates or misformatted numbers here will cascade into bad model fits or errors later.  
 
-    **Step 2.** Preview and validate your data  
-    • Dates are parsed and invalid dates flagged  
-    • Commas are removed from numeric columns  
+    **Step 2. Preview and validate your data**  
+    • **Significance:** Ensures that your dates parse correctly and that numeric columns contain real numbers.  
+    • **Impact:** Invalid dates or stray commas can lead to empty/NaN values that skew model training and break visualizations.  
 
-    **Step 3.** Configure forecasting options  
-    • Adjust *Changepoint Priors* and *Seasonality Priors* using sliders  
-    • (Optional) Enter manual changepoints as comma-separated dates  
+    **Step 3. Configure forecasting options**  
+    • **Changepoint Prior Scale:** Controls how sensitive the model is to trend shifts.  
+      - **Low value** → smoother trend, fewer sudden changes captured.  
+      - **High value** → model can overfit noise, seeing too many “breaks.”  
+    • **Seasonality Prior Scale:** Governs how strongly the model enforces seasonal patterns.  
+      - **Low value** → seasonality is muted, good for noisy data.  
+      - **High value** → seasonality dominates, may over-emphasize repeating cycles.  
+    • **Manual Changepoints:** Let you force in dates where you know the trend shifted (e.g., promotions, pandemics).  
 
-    **Step 4.** Specify data frequency  
-    • Choose to **infer** automatically or pick Daily/Weekly/Monthly/Yearly  
-    • Data will be resampled to regular intervals  
+    **Step 4. Specify data frequency**  
+    • **Significance:** Prophet assumes evenly spaced data.  
+    • **Impact:** Misaligned or irregular intervals lead to misleading forecasts—e.g., inferring weekly seasonality on daily data will be wrong.  
+    • **Inference vs. Manual:** Auto-inference works most of the time, but if your data has gaps or custom intervals, pick your own.  
 
-    **Step 5.** Run the forecast  
-    • Click **Run Forecast**  
-    • View the time-series plot, decomposition, and year-on-year matrix  
+    **Step 5. Run the forecast**  
+    • **Significance:** This triggers model training and prediction.  
+    • **Impact:** You’ll see:  
+      1. **Forecast Plot:** Visual check that your model “makes sense.”  
+      2. **Decomposition Plot:** Breaks down trend, weekly & yearly seasonality—useful for diagnosing over/underfitting.  
+      3. **Year-on-Year Matrix:** Numerical comparison by month/year, helping you spot anomalies or growth rates.  
 
-    **Step 6.** Download your results  
-    • Everything (data + plots) is packaged into a ZIP for easy sharing  
+    **Step 6. Download your results**  
+    • **Significance:** Packages your raw forecasts, summary matrices, and plots for sharing or deeper analysis.  
+    • **Impact:** Keeps everyone on the same page—no copy-paste errors, and you have a ZIP of exactly what you saw.  
     """)
 
 # File Upload Section
