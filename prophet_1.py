@@ -12,6 +12,9 @@ st.set_page_config(page_title="Prophet Forecasting App", layout="wide")
 
 # Title
 st.title("Prophet Forecasting App")
+st.markdown("""
+This App takes Meta's Prophet Forecasting model and lets you apply it to SEO data to establish forecasts based on historic data. 
+""")
 
 with st.expander("How to use this app"):
     st.markdown("""
