@@ -17,8 +17,6 @@ st.markdown("This App takes Meta's Prophet Forecasting model and lets you apply 
 with st.expander("How to use this app"):
     st.markdown("""
     **Step 1. Upload your CSV file**  
-    • **Significance:** The quality of your input data drives the accuracy of any forecast.  
-    • **Impact:** Missing dates or misformatted numbers here will cascade into bad model fits or errors later.  
 
     **Step 2. Preview and validate your data**  
     • **Significance:** Ensures that your dates parse correctly and that numeric columns contain real numbers.  
