@@ -12,7 +12,7 @@ st.set_page_config(page_title="Prophet Forecasting App", layout="wide")
 
 # Title
 st.title("Prophet Forecasting App")
-st.text("This App takes Meta's Prophet Forecasting model and lets you apply it to SEO data to establish forecasts based on historic data. By <a href="https://ww.chris-green.net/">Chris Green</a>.)
+st.text("This App takes Meta's Prophet Forecasting model and lets you apply it to SEO data to establish forecasts based on historic data. By [https://ww.chris-green.net/|Chris Green]
 
 with st.expander("How to use this app"):
     st.markdown("""
