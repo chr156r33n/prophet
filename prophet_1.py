@@ -2,7 +2,7 @@ import streamlit as st
 from prophet import Prophet
 from prophet.plot import plot_plotly, plot_components_plotly
 import pandas as pd
-from plotly.io import write_image
+from plotly.io import to_html  # <-- changed from write_image
 import zipfile
 import io
 import plotly.express as px
@@ -161,18 +161,20 @@ if uploaded_file:
                         fig_decomp = plot_components_plotly(model, forecast)
                         st.plotly_chart(fig_decomp)
 
-                        # Prepare download ZIP
+                        # Prepare download ZIP (HTML instead of PNG)
                         buffer = io.BytesIO()
                         with zipfile.ZipFile(buffer, "w") as zf:
+                            # CSVs
                             csv_all = io.StringIO(); combined.to_csv(csv_all, index=False)
                             zf.writestr("combined_data.csv", csv_all.getvalue())
                             csv_mat = io.StringIO(); matrix.to_csv(csv_mat, index=True)
                             zf.writestr("forecast_matrix.csv", csv_mat.getvalue())
-                            b1 = io.BytesIO(); write_image(fig_yoy, b1, format="png")
-                            zf.writestr("yoy_comparison.png", b1.getvalue())
-                            for name, fig in [("forecast", fig_forecast), ("components", fig_decomp)]:
-                                b2 = io.BytesIO(); write_image(fig, b2, format="png")
-                                zf.writestr(f"{name}.png", b2.getvalue())
+
+                            # Interactive HTML charts (self-contained)
+                            zf.writestr("yoy_comparison.html", to_html(fig_yoy, full_html=True, include_plotlyjs="cdn"))
+                            zf.writestr("forecast.html", to_html(fig_forecast, full_html=True, include_plotlyjs="cdn"))
+                            zf.writestr("components.html", to_html(fig_decomp, full_html=True, include_plotlyjs="cdn"))
+
                         buffer.seek(0)
 
                         st.success("Forecasting complete! Download your results below.")
