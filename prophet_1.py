@@ -78,7 +78,7 @@ if uploaded_file:
                 st.info(f"Regressors: {', '.join(regressor_cols)} (if any)")
 
                 # Forecast configuration
-                changepoint_prior_scale = st.slider("Changepoint Prior Scale", 0.0, 1.0, 0.5, 0.1)
+                changepoint_prior_scale = st.slider("Changepoint Prior Scale", min_value=0.0, max_value=1.0, value=0.5, step=0.01)
                 seasonality_prior_scale = st.slider("Seasonality Prior Scale", 1.0, 20.0, 10.0, 0.5)
                 manual_changepoints = st.text_area(
                     "Manual Changepoints (comma-separated dates, e.g., 2024-01-01,2024-06-01)", ""
