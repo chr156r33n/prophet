@@ -12,39 +12,16 @@ import plotly.express as px
 # Helpers
 # ----------------------------
 def coerce_numeric_allow_blanks(series: pd.Series) -> pd.Series:
-    """
-    Convert a series to numeric while allowing blanks/NA-like values.
-    Commas are removed. Non-numeric junk becomes NaN.
-    """
     raw = series.astype(str).str.strip()
     raw = raw.str.replace(",", "", regex=False)
-    # Convert to numeric; junk becomes NaN
     return pd.to_numeric(raw, errors="coerce")
 
 def find_true_non_numeric_examples(original_series: pd.Series, coerced: pd.Series, max_examples: int = 5):
-    """
-    Identify values that are non-numeric BUT not just blanks/NA placeholders.
-    Returns up to max_examples unique examples.
-    """
     raw = original_series.astype(str).str.strip()
     na_like = {"", "nan", "NaN", "none", "None", "null", "NULL", "NA", "N/A"}
     bad_mask = coerced.isna() & ~raw.isin(na_like)
-
     examples = raw[bad_mask].dropna().unique()
     return list(examples[:max_examples])
-
-def freq_to_days(freq_code: str) -> int:
-    """Rough mapping to days for backtest defaults + sanity checks."""
-    if freq_code.startswith("D"):
-        return 1
-    if freq_code.startswith("W"):
-        return 7
-    if freq_code.startswith("M"):
-        return 30
-    if freq_code.startswith("Y") or freq_code.startswith("A"):
-        return 365
-    # fallback
-    return 1
 
 # ----------------------------
 # App
@@ -80,11 +57,76 @@ with st.expander("How to use this app"):
     • Rolling-origin cross-validation to score out-of-sample performance
     """)
 
+# ----------------------------
+# Sidebar config (all controls live here)
+# ----------------------------
+st.sidebar.header("Forecast Settings")
+
+# Keep defaults stable across reruns
+if "run_forecast" not in st.session_state:
+    st.session_state.run_forecast = False
+
+if "run_backtest_now" not in st.session_state:
+    st.session_state.run_backtest_now = False
+
+# Put widgets in a form so changing them doesn't immediately "do stuff"
+with st.sidebar.form("config_form", clear_on_submit=False):
+    st.subheader("Model")
+    changepoint_prior_scale = st.slider(
+        "Changepoint Prior Scale",
+        min_value=0.0, max_value=1.0, value=0.05, step=0.01
+    )
+    seasonality_prior_scale = st.slider(
+        "Seasonality Prior Scale",
+        min_value=1.0, max_value=20.0, value=10.0, step=0.5
+    )
+    manual_changepoints = st.text_area(
+        "Manual Changepoints (comma-separated dates, e.g., 2024-01-01,2024-06-01)",
+        ""
+    )
+
+    st.subheader("Data frequency & horizon")
+    freq_choice = st.selectbox(
+        "Frequency",
+        ["Infer Automatically", "Daily", "Weekly", "Monthly", "Yearly"],
+        index=0
+    )
+    forecast_periods = st.number_input(
+        "Future periods to forecast (used only if your file has no blank future metric rows)",
+        min_value=0, value=0, step=1
+    )
+
+    st.subheader("Backtest (Cross-Validation)")
+    run_backtest = st.checkbox("Run backtest (rolling-origin CV)", value=False)
+
+    bt_initial_days = st.number_input("Initial training window (days)", min_value=30, value=365, step=30)
+    bt_period_days = st.number_input("Period between cutoffs (days)", min_value=7, value=30, step=7)
+    bt_horizon_days = st.number_input("Forecast horizon (days)", min_value=7, value=90, step=7)
+
+    submitted = st.form_submit_button("Apply settings")
+
+# ----------------------------
+# File upload (main area)
+# ----------------------------
 uploaded_file = st.file_uploader(
     "Upload your CSV file (first col = date, second col = metric, optional regressors after)",
     type=["csv"]
 )
 
+# ----------------------------
+# Run button in sidebar (does not cause app to "forget" controls)
+# ----------------------------
+st.sidebar.divider()
+run_clicked = st.sidebar.button("Run Forecast", type="primary")
+if run_clicked:
+    st.session_state.run_forecast = True
+else:
+    # Only reset if user explicitly changes file or hits a (future) reset button
+    pass
+
+# ----------------------------
+# Main logic
+# ----------------------------
 if uploaded_file:
     try:
         data = pd.read_csv(uploaded_file)
@@ -104,7 +146,7 @@ if uploaded_file:
             st.error(f"Invalid dates detected in column '{date_col}'.")
             st.stop()
 
-        # Coerce metric, allowing blanks (common for future rows)
+        # Coerce metric, allowing blanks
         metric_coerced = coerce_numeric_allow_blanks(data[metric_col])
         non_numeric_examples = find_true_non_numeric_examples(data[metric_col], metric_coerced)
         if non_numeric_examples:
@@ -115,7 +157,7 @@ if uploaded_file:
             st.stop()
         data[metric_col] = metric_coerced
 
-        # Coerce regressors (still allow blanks, but we may need to fill later)
+        # Coerce regressors
         for reg_col in regressor_cols:
             reg_coerced = coerce_numeric_allow_blanks(data[reg_col])
             reg_bad = find_true_non_numeric_examples(data[reg_col], reg_coerced)
@@ -130,53 +172,16 @@ if uploaded_file:
         st.info(f"Date column: '{date_col}', Metric column: '{metric_col}'")
         st.info(f"Regressors: {', '.join(regressor_cols) if regressor_cols else '(none)'}")
 
-        # Model controls
-        changepoint_prior_scale = st.slider(
-            "Changepoint Prior Scale",
-            min_value=0.0, max_value=1.0, value=0.05, step=0.01
-        )
-        seasonality_prior_scale = st.slider(
-            "Seasonality Prior Scale",
-            1.0, 20.0, 10.0, 0.5
-        )
-        manual_changepoints = st.text_area(
-            "Manual Changepoints (comma-separated dates, e.g., 2024-01-01,2024-06-01)",
-            ""
-        )
-
-        # Frequency selection OUTSIDE the button so it doesn’t reset on rerun
-        freq_choice = st.selectbox(
-            "Frequency",
-            ["Infer Automatically", "Daily", "Weekly", "Monthly", "Yearly"],
-            index=0
-        )
-
-        # If user did NOT supply future blank rows, allow forecasting forward N periods
-        forecast_periods = st.number_input(
-            "Future periods to forecast (used only if your file has no blank future metric rows)",
-            min_value=0, value=0, step=1
-        )
-
-        # Backtest controls
-        st.subheader("Backtest (Cross-Validation)")
-        run_backtest = st.checkbox("Run backtest (rolling-origin CV)", value=False)
-
-        colA, colB, colC = st.columns(3)
-        with colA:
-            bt_initial_days = st.number_input("Initial training window (days)", min_value=30, value=365, step=30)
-        with colB:
-            bt_period_days = st.number_input("Period between cutoffs (days)", min_value=7, value=30, step=7)
-        with colC:
-            bt_horizon_days = st.number_input("Forecast horizon (days)", min_value=7, value=90, step=7)
-
         # Prepare Prophet frame
         df = data.rename(columns={date_col: "ds", metric_col: "y"}).copy()
         df = df.sort_values("ds").reset_index(drop=True)
 
         st.write("Processed Data (pre-resample):", df.head())
 
-        if st.button("Run Forecast"):
+        # Only run heavy work when user clicks Run Forecast
+        if st.session_state.run_forecast:
             with st.spinner("Running forecast..."):
+
                 # Resolve frequency
                 if freq_choice == "Infer Automatically":
                     inferred = pd.infer_freq(df["ds"])
@@ -193,16 +198,15 @@ if uploaded_file:
                 # Resample to regular frequency
                 df = df.set_index("ds").asfreq(freq).reset_index()
 
-                # Prophet can handle missing y, BUT regressors must be present in future rows used for predict()
+                # Regressors must exist in rows used for predict()
                 if regressor_cols:
                     for reg_col in regressor_cols:
-                        if reg_col in df.columns:
-                            if df[reg_col].isna().any():
-                                st.warning(
-                                    f"Regressor '{reg_col}' has missing values after resampling. "
-                                    f"Forward/back-filling so Prophet can run. (Just don't confuse this with real future regressor data.)"
-                                )
-                                df[reg_col] = df[reg_col].ffill().bfill()
+                        if reg_col in df.columns and df[reg_col].isna().any():
+                            st.warning(
+                                f"Regressor '{reg_col}' has missing values after resampling. "
+                                f"Forward/back-filling so Prophet can run. (Not real future regressor data.)"
+                            )
+                            df[reg_col] = df[reg_col].ffill().bfill()
 
                 st.write(f"Data resampled to {freq} frequency:")
                 st.dataframe(df.head())
@@ -229,18 +233,15 @@ if uploaded_file:
                     model.changepoints = cps
                     st.write("Using manual changepoints:", cps)
 
-                # Fit on observed history
+                # Fit
                 model.fit(train_df)
 
-                # Build future for prediction:
-                # 1) If the file contains blank future metric rows -> predict exactly those dates
-                # 2) Else -> forecast forward N periods
+                # Build future:
                 if not missing_future_df.empty:
                     future = missing_future_df[["ds"] + regressor_cols].copy()
                     st.info(f"Detected {len(missing_future_df)} blank metric rows. Forecasting those dates from your file.")
                 else:
                     future = model.make_future_dataframe(periods=int(forecast_periods), freq=freq)
-                    # Add regressors for future horizon: simplest is to carry last known value
                     for reg_col in regressor_cols:
                         last_val = train_df[reg_col].dropna().iloc[-1] if train_df[reg_col].notna().any() else 0.0
                         future[reg_col] = last_val
@@ -262,7 +263,6 @@ if uploaded_file:
 
                 if matrix.shape[1] >= 2:
                     prev, curr = matrix.columns[-2], matrix.columns[-1]
-                    # avoid divide by zero explosions
                     denom = matrix[prev].replace(0, pd.NA)
                     matrix["% Change"] = ((matrix[curr] - matrix[prev]) / denom).astype(float).round(4) * 100
 
@@ -281,24 +281,21 @@ if uploaded_file:
                 st.plotly_chart(fig_yoy, use_container_width=True)
 
                 st.write("Forecast Plot:")
-                # plot_plotly expects forecast over future ds, but it will also show history via model
                 fig_forecast = plot_plotly(model, forecast)
                 st.plotly_chart(fig_forecast, use_container_width=True)
 
                 st.write("Decomposition Plot:")
-                # components plot is based on forecast; ok for future horizon too
                 fig_decomp = plot_components_plotly(model, forecast)
                 st.plotly_chart(fig_decomp, use_container_width=True)
 
                 # -----------------------
-                # Backtest (Cross-Validation)
+                # Backtest
                 # -----------------------
                 cv_df = None
                 perf_df = None
                 fig_bt = None
 
                 if run_backtest:
-                    # Sanity check: backtest uses ONLY training data (observed y)
                     train_span_days = (train_df["ds"].max() - train_df["ds"].min()).days
                     needed = int(bt_initial_days + bt_horizon_days + bt_period_days)
 
@@ -314,7 +311,6 @@ if uploaded_file:
                             period = f"{int(bt_period_days)} days"
                             horizon = f"{int(bt_horizon_days)} days"
 
-                            # cross_validation re-fits internally using the provided fitted model spec
                             cv_df = cross_validation(
                                 model,
                                 initial=initial,
@@ -346,11 +342,10 @@ if uploaded_file:
                         st.plotly_chart(fig_bt, use_container_width=True)
 
                 # -----------------------
-                # Prepare download ZIP (HTML + CSVs)
+                # Prepare download ZIP
                 # -----------------------
                 buffer = io.BytesIO()
                 with zipfile.ZipFile(buffer, "w") as zf:
-                    # CSVs
                     csv_combined = io.StringIO()
                     combined.to_csv(csv_combined, index=False)
                     zf.writestr("combined_data.csv", csv_combined.getvalue())
@@ -359,12 +354,10 @@ if uploaded_file:
                     matrix.to_csv(csv_matrix, index=True)
                     zf.writestr("forecast_matrix.csv", csv_matrix.getvalue())
 
-                    # Charts
                     zf.writestr("yoy_comparison.html", to_html(fig_yoy, full_html=True, include_plotlyjs="cdn"))
                     zf.writestr("forecast.html", to_html(fig_forecast, full_html=True, include_plotlyjs="cdn"))
                     zf.writestr("components.html", to_html(fig_decomp, full_html=True, include_plotlyjs="cdn"))
 
-                    # Backtest exports (if run)
                     if cv_df is not None:
                         csv_cv = io.StringIO()
                         cv_df.to_csv(csv_cv, index=False)
@@ -388,5 +381,12 @@ if uploaded_file:
                     mime="application/zip",
                 )
 
+            # Optional: auto-reset the run flag so it doesn't re-run heavy compute on every rerun
+            st.session_state.run_forecast = False
+        else:
+            st.info("Configure options in the sidebar, then click **Run Forecast**.")
+
     except Exception as e:
         st.error(f"Failed to process the uploaded file: {e}")
+else:
+    st.info("Upload a CSV to begin.")
