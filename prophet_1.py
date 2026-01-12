@@ -25,16 +25,12 @@ def find_true_non_numeric_examples(original_series: pd.Series, coerced: pd.Serie
     return list(examples[:max_examples])
 
 def ensure_timedelta_days(td_series: pd.Series) -> pd.Series:
-    """Prophet CV uses Timedelta for horizon; convert to numeric days."""
     if hasattr(td_series, "dt") and np.issubdtype(td_series.dtype, np.timedelta64):
         return td_series.dt.total_seconds() / 86400.0
     return td_series
 
 def normalize_backtest_frames(cv_df: pd.DataFrame | None, perf_df: pd.DataFrame | None):
-    """
-    Ensure both cv_df and perf_df have a real 'horizon' column.
-    Prophet/prophet-diagnostics can return 'horizon' as an index depending on version.
-    """
+    # Ensure a real 'horizon' column exists
     if cv_df is not None and not cv_df.empty:
         if "horizon" not in cv_df.columns:
             if getattr(cv_df.index, "name", None) == "horizon":
@@ -53,7 +49,8 @@ def normalize_backtest_frames(cv_df: pd.DataFrame | None, perf_df: pd.DataFrame 
     return cv_df, perf_df
 
 def bt_params_tuple(bt_initial_days, bt_period_days, bt_horizon_days, freq, regressor_cols,
-                    changepoint_prior_scale, seasonality_prior_scale, manual_changepoints):
+                    changepoint_prior_scale, seasonality_prior_scale, manual_changepoints,
+                    seasonality_mode, use_log_y):
     return (
         int(bt_initial_days),
         int(bt_period_days),
@@ -63,202 +60,140 @@ def bt_params_tuple(bt_initial_days, bt_period_days, bt_horizon_days, freq, regr
         float(changepoint_prior_scale),
         float(seasonality_prior_scale),
         str(manual_changepoints).strip(),
+        str(seasonality_mode),
+        bool(use_log_y),
     )
+
+def safe_log1p(y: pd.Series) -> pd.Series:
+    # Handles zeros safely; log1p is nice for SEO series
+    return np.log1p(y.clip(lower=0))
+
+def safe_expm1(y: pd.Series) -> pd.Series:
+    return np.expm1(y)
 
 def render_interpretable_backtest_views(cv_df: pd.DataFrame):
     st.subheader("Backtest: Interpretable Views")
 
     cv = cv_df.copy()
     if "horizon" not in cv.columns:
-        st.warning("Backtest output is missing 'horizon' even after normalization. Skipping interpretable views.")
+        st.warning("Backtest output is missing 'horizon'.")
+        return
+    if not {"ds", "y", "yhat"}.issubset(set(cv.columns)):
+        st.warning("Backtest output is missing one of: ds, y, yhat")
         return
 
-    # Standard Prophet CV cols: ds, y, yhat, yhat_lower, yhat_upper, cutoff, horizon
-    needed_cols = {"ds", "y", "yhat"}
-    if not needed_cols.issubset(set(cv.columns)):
-        st.warning(f"Backtest output is missing required columns: {needed_cols - set(cv.columns)}")
-        return
-
-    # Make sure dates are datetime
     cv["ds"] = pd.to_datetime(cv["ds"], errors="coerce")
     if "cutoff" in cv.columns:
         cv["cutoff"] = pd.to_datetime(cv["cutoff"], errors="coerce")
 
-    # Errors
     cv["abs_err"] = (cv["y"] - cv["yhat"]).abs()
-    cv["err"] = (cv["y"] - cv["yhat"])
+    cv["ape"] = (cv["abs_err"] / cv["y"].replace(0, np.nan)).astype(float)
 
-    # Intervals if present
     if "yhat_lower" in cv.columns and "yhat_upper" in cv.columns:
         cv["in_80"] = (cv["y"] >= cv["yhat_lower"]) & (cv["y"] <= cv["yhat_upper"])
     else:
         cv["in_80"] = np.nan
 
-    # APE
-    cv["ape"] = (cv["abs_err"] / cv["y"].replace(0, np.nan)).astype(float)
-
-    # Horizon days
-    try:
-        cv["horizon_days"] = ensure_timedelta_days(cv["horizon"])
-    except Exception:
-        # If horizon is not timedelta, attempt coercion
-        cv["horizon_days"] = pd.to_numeric(cv["horizon"], errors="coerce")
-
+    cv["horizon_days"] = ensure_timedelta_days(cv["horizon"])
     cv["month"] = cv["ds"].dt.month
-    cv["year"] = cv["ds"].dt.year
 
-    # 1) Scorecard
     mape = float(cv["ape"].dropna().mean() * 100) if cv["ape"].notna().any() else np.nan
     median_ape = float(cv["ape"].dropna().median() * 100) if cv["ape"].notna().any() else np.nan
     mae = float(cv["abs_err"].mean()) if cv["abs_err"].notna().any() else np.nan
-    median_abs = float(cv["abs_err"].median()) if cv["abs_err"].notna().any() else np.nan
-
     coverage = float(cv["in_80"].dropna().mean() * 100) if cv["in_80"].notna().any() else np.nan
-    within_10 = float((cv["ape"] <= 0.10).mean() * 100) if cv["ape"].notna().any() else np.nan
-    within_20 = float((cv["ape"] <= 0.20).mean() * 100) if cv["ape"].notna().any() else np.nan
 
-    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    c1, c2, c3, c4 = st.columns(4)
     c1.metric("MAPE (avg)", f"{mape:.1f}%" if np.isfinite(mape) else "n/a")
     c2.metric("APE (median)", f"{median_ape:.1f}%" if np.isfinite(median_ape) else "n/a")
     c3.metric("MAE (avg)", f"{mae:,.2f}" if np.isfinite(mae) else "n/a")
-    c4.metric("Abs Err (median)", f"{median_abs:,.2f}" if np.isfinite(median_abs) else "n/a")
-    c5.metric("Within ±10%", f"{within_10:.1f}%" if np.isfinite(within_10) else "n/a")
-    c6.metric("80% band coverage", f"{coverage:.1f}%" if np.isfinite(coverage) else "n/a")
+    c4.metric("80% band coverage", f"{coverage:.1f}%" if np.isfinite(coverage) else "n/a")
 
-    # 2) Actual vs predicted
-    with st.expander("Actual vs Predicted (CV predictions)", expanded=True):
-        cv_plot = cv.sort_values("ds")
-        fig_cv = px.line(
-            cv_plot,
-            x="ds",
-            y=["y", "yhat"],
-            labels={"value": "Metric", "variable": ""},
-            title="CV: Actual vs Predicted (y vs yhat)",
+    # Horizon buckets (fast read)
+    bins = [-np.inf, 7, 14, 30, 60, 90, 120, 180, np.inf]
+    labels = ["≤7d", "8–14d", "15–30d", "31–60d", "61–90d", "91–120d", "121–180d", "180d+"]
+    cv["h_bucket"] = pd.cut(cv["horizon_days"], bins=bins, labels=labels)
+
+    bucket = cv.groupby("h_bucket", dropna=False).agg(
+        n=("y", "size"),
+        mape=("ape", lambda s: float(s.dropna().mean() * 100) if s.notna().any() else np.nan),
+        mae=("abs_err", "mean"),
+        coverage=("in_80", lambda s: float(s.dropna().mean() * 100) if s.notna().any() else np.nan),
+    ).reset_index()
+
+    st.dataframe(bucket)
+
+def compute_baseline_history_view(model: Prophet, hist_df: pd.DataFrame, regressor_cols: list[str], use_log_y: bool):
+    """
+    Returns dataframe with ds, y_actual, baseline(trend), ratio actual/baseline
+    Uses model.predict over history, then takes 'trend' as baseline.
+    """
+    pred_in = hist_df[["ds"] + regressor_cols].copy() if regressor_cols else hist_df[["ds"]].copy()
+    pred_out = model.predict(pred_in)
+
+    out = pd.DataFrame({
+        "ds": pd.to_datetime(pred_out["ds"]),
+        "trend": pred_out["trend"].astype(float),
+    })
+
+    # actual in same scale as trained
+    out = out.merge(hist_df[["ds", "y"]], on="ds", how="left").rename(columns={"y": "y_model_scale"})
+    if use_log_y:
+        out["y_actual"] = safe_expm1(out["y_model_scale"])
+        out["baseline"] = safe_expm1(out["trend"])
+    else:
+        out["y_actual"] = out["y_model_scale"]
+        out["baseline"] = out["trend"]
+
+    out["ratio_actual_to_baseline"] = out["y_actual"] / out["baseline"].replace(0, np.nan)
+    return out.sort_values("ds")
+
+def run_baseline_only_cv(train_df_model_scale: pd.DataFrame, freq: str,
+                         cps: float, sps: float, seasonality_mode: str,
+                         bt_initial_days: int, bt_period_days: int, bt_horizon_days: int):
+    """
+    Baseline-only model: no regressors, same y scale as training df (already log if needed).
+    """
+    base_model = Prophet(
+        changepoint_prior_scale=cps,
+        seasonality_prior_scale=sps,
+        seasonality_mode=seasonality_mode,
+    )
+    base_model.fit(train_df_model_scale[["ds", "y"]])
+
+    initial = f"{int(bt_initial_days)} days"
+    period = f"{int(bt_period_days)} days"
+    horizon = f"{int(bt_horizon_days)} days"
+
+    cv = cross_validation(
+        base_model,
+        initial=initial,
+        period=period,
+        horizon=horizon,
+        parallel=None,
+    )
+    perf = performance_metrics(cv)
+    cv, perf = normalize_backtest_frames(cv, perf)
+    return base_model, cv, perf
+
+def stability_sweep_trends(train_df_model_scale: pd.DataFrame,
+                           cps_values: list[float],
+                           sps: float, seasonality_mode: str,
+                           hist_ds: pd.Series):
+    """
+    Fit baseline-only models with different CPS, return trend curves aligned on hist_ds.
+    """
+    curves = []
+    for cps in cps_values:
+        m = Prophet(
+            changepoint_prior_scale=float(cps),
+            seasonality_prior_scale=float(sps),
+            seasonality_mode=seasonality_mode,
         )
-        st.plotly_chart(fig_cv, use_container_width=True)
-
-        if "yhat_lower" in cv_plot.columns and "yhat_upper" in cv_plot.columns:
-            fig_bounds = px.line(
-                cv_plot,
-                x="ds",
-                y=["yhat_lower", "yhat_upper"],
-                labels={"value": "Metric", "variable": ""},
-                title="CV: Prediction interval bounds (lower/upper)",
-            )
-            st.plotly_chart(fig_bounds, use_container_width=True)
-
-    # 3) Error over time
-    with st.expander("Error over time (absolute and % error)", expanded=True):
-        fig_abs = px.line(
-            cv.sort_values("ds"),
-            x="ds",
-            y="abs_err",
-            labels={"abs_err": "Absolute error"},
-            title="CV: Absolute error over time",
-        )
-        st.plotly_chart(fig_abs, use_container_width=True)
-
-        cv_pct = cv.dropna(subset=["ape"]).copy()
-        if not cv_pct.empty:
-            cv_pct["ape_pct"] = cv_pct["ape"] * 100
-            fig_ape = px.line(
-                cv_pct.sort_values("ds"),
-                x="ds",
-                y="ape_pct",
-                labels={"ape_pct": "APE (%)"},
-                title="CV: Percent error (APE) over time",
-            )
-            st.plotly_chart(fig_ape, use_container_width=True)
-
-    # 4) Horizon buckets
-    with st.expander("Error by horizon bucket", expanded=True):
-        bins = [-np.inf, 7, 14, 30, 60, 90, 120, 180, np.inf]
-        labels = ["≤7d", "8–14d", "15–30d", "31–60d", "61–90d", "91–120d", "121–180d", "180d+"]
-        cv["h_bucket"] = pd.cut(cv["horizon_days"], bins=bins, labels=labels)
-
-        bucket = cv.groupby("h_bucket", dropna=False).agg(
-            n=("y", "size"),
-            mape=("ape", lambda s: float(s.dropna().mean() * 100) if s.notna().any() else np.nan),
-            median_ape=("ape", lambda s: float(s.dropna().median() * 100) if s.notna().any() else np.nan),
-            mae=("abs_err", "mean"),
-            median_abs=("abs_err", "median"),
-        ).reset_index()
-
-        if "in_80" in cv.columns and cv["in_80"].notna().any():
-            cov = cv.groupby("h_bucket", dropna=False)["in_80"].mean().reset_index(name="coverage")
-            cov["coverage"] = cov["coverage"] * 100
-            bucket = bucket.merge(cov, on="h_bucket", how="left")
-        else:
-            bucket["coverage"] = np.nan
-
-        st.dataframe(bucket)
-
-        bucket_plot = bucket.dropna(subset=["mape"]).copy()
-        if not bucket_plot.empty:
-            fig_bucket = px.bar(
-                bucket_plot,
-                x="h_bucket",
-                y="mape",
-                labels={"h_bucket": "Horizon bucket", "mape": "MAPE (%)"},
-                title="CV: Average % error (MAPE) by horizon bucket",
-            )
-            st.plotly_chart(fig_bucket, use_container_width=True)
-
-    # 5) Heatmap
-    with st.expander("Heatmap: where it fails (month x horizon bucket)", expanded=True):
-        if "h_bucket" not in cv.columns:
-            bins = [-np.inf, 7, 14, 30, 60, 90, 120, 180, np.inf]
-            labels = ["≤7d", "8–14d", "15–30d", "31–60d", "61–90d", "91–120d", "121–180d", "180d+"]
-            cv["h_bucket"] = pd.cut(cv["horizon_days"], bins=bins, labels=labels)
-
-        heat = cv.groupby(["month", "h_bucket"], dropna=False)["ape"].mean().reset_index()
-        heat["mape_pct"] = heat["ape"] * 100
-
-        fig_heat = px.density_heatmap(
-            heat.dropna(subset=["h_bucket"]),
-            x="h_bucket",
-            y="month",
-            z="mape_pct",
-            histfunc="avg",
-            labels={"h_bucket": "Horizon bucket", "month": "Month", "mape_pct": "MAPE (%)"},
-            title="CV: Avg % error by month-of-year and horizon bucket",
-        )
-        st.plotly_chart(fig_heat, use_container_width=True)
-
-    # 6) Tolerance bands
-    with st.expander("Accuracy bands: % of forecasts within ±10% / ±20%", expanded=True):
-        if "h_bucket" not in cv.columns:
-            bins = [-np.inf, 7, 14, 30, 60, 90, 120, 180, np.inf]
-            labels = ["≤7d", "8–14d", "15–30d", "31–60d", "61–90d", "91–120d", "121–180d", "180d+"]
-            cv["h_bucket"] = pd.cut(cv["horizon_days"], bins=bins, labels=labels)
-
-        acc = cv.groupby("h_bucket", dropna=False).agg(
-            n=("y", "size"),
-            within_10=("ape", lambda s: float((s <= 0.10).mean() * 100) if s.notna().any() else np.nan),
-            within_20=("ape", lambda s: float((s <= 0.20).mean() * 100) if s.notna().any() else np.nan),
-        ).reset_index()
-
-        st.dataframe(acc)
-
-        acc_long = acc.melt(
-            id_vars=["h_bucket", "n"],
-            value_vars=["within_10", "within_20"],
-            var_name="band",
-            value_name="pct",
-        )
-        acc_long["band"] = acc_long["band"].map({"within_10": "Within ±10%", "within_20": "Within ±20%"})
-
-        fig_acc = px.line(
-            acc_long.dropna(subset=["pct"]),
-            x="h_bucket",
-            y="pct",
-            color="band",
-            markers=True,
-            labels={"h_bucket": "Horizon bucket", "pct": "% of forecasts"},
-            title="CV: Share of forecasts within tolerance bands",
-        )
-        st.plotly_chart(fig_acc, use_container_width=True)
-
+        m.fit(train_df_model_scale[["ds", "y"]])
+        pred = m.predict(pd.DataFrame({"ds": hist_ds}))
+        curves.append(pd.Series(pred["trend"].astype(float).values, name=str(cps)))
+    trend_mat = pd.concat(curves, axis=1)
+    return trend_mat
 
 # ----------------------------
 # App
@@ -279,19 +214,11 @@ with st.expander("How to use this app"):
     • Ensures dates parse correctly and numeric columns are numeric.  
     • Blanks in the metric column are allowed (often future periods).  
 
-    **Step 3. Configure forecasting options**  
-    • Changepoint Prior Scale: trend flexibility  
-    • Seasonality Prior Scale: seasonality strength  
-    • Manual Changepoints: force known shift dates  
+    **Step 3. Configure forecasting options (sidebar)**
 
-    **Step 4. Specify data frequency**  
-    • Prophet works best with evenly spaced data (resampling helps).  
+    **Step 4. Run forecast**
 
-    **Step 5. Run the forecast**  
-    • Forecast plot, components, monthly YoY matrix  
-
-    **Step 6. (Optional) Backtest**  
-    • Rolling-origin cross-validation to score out-of-sample performance
+    **Step 5. Backtest + Baseline tests**
     """)
 
 # ----------------------------
@@ -300,16 +227,35 @@ with st.expander("How to use this app"):
 st.sidebar.header("Forecast Settings")
 
 # Session state init
-for k, v in {
+defaults = {
     "run_forecast": False,
     "bt_cv_df": None,
     "bt_perf_df": None,
     "bt_params": None,
-}.items():
+    "bt_cv_base_df": None,
+    "bt_perf_base_df": None,
+    "bt_base_params": None,
+}
+for k, v in defaults.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
 with st.sidebar.form("config_form", clear_on_submit=False):
+    st.subheader("Target transform")
+    use_log_y = st.checkbox(
+        "Model on log(1+y) scale (recommended for SEO)",
+        value=True,
+        help="Stabilises variance and makes seasonality/impacts proportional."
+    )
+
+    st.subheader("Seasonality")
+    seasonality_mode = st.selectbox(
+        "Seasonality mode",
+        ["multiplicative", "additive"],
+        index=0,
+        help="Multiplicative usually fits SEO better."
+    )
+
     st.subheader("Model")
     changepoint_prior_scale = st.slider("Changepoint Prior Scale", 0.0, 1.0, 0.05, 0.01)
     seasonality_prior_scale = st.slider("Seasonality Prior Scale", 1.0, 20.0, 10.0, 0.5)
@@ -325,11 +271,18 @@ with st.sidebar.form("config_form", clear_on_submit=False):
     )
 
     st.subheader("Backtest (Cross-Validation)")
-    run_backtest = st.checkbox("Run backtest (rolling-origin CV)", value=False)
+    run_backtest = st.checkbox("Run backtest (CV)", value=False)
     bt_initial_days = st.number_input("Initial training window (days)", min_value=30, value=365, step=30)
     bt_period_days = st.number_input("Period between cutoffs (days)", min_value=7, value=30, step=7)
     bt_horizon_days = st.number_input("Forecast horizon (days)", min_value=7, value=90, step=7)
 
+    st.subheader("Baseline tests")
+    run_baseline_tests = st.checkbox(
+        "Run baseline tests (trend reliability)",
+        value=True,
+        help="Adds baseline-vs-actual, baseline-only CV, and stability sweep."
+    )
+    sweep_points = st.selectbox("Baseline stability sweep size", [3, 5, 7], index=1)
     st.form_submit_button("Apply settings")
 
 st.sidebar.divider()
@@ -363,13 +316,11 @@ try:
     metric_col = data.columns[1]
     regressor_cols = list(data.columns[2:])
 
-    # Parse date
     data[date_col] = pd.to_datetime(data[date_col], errors="coerce")
     if data[date_col].isna().any():
         st.error(f"Invalid dates detected in column '{date_col}'.")
         st.stop()
 
-    # Coerce metric
     metric_coerced = coerce_numeric_allow_blanks(data[metric_col])
     bad_metric = find_true_non_numeric_examples(data[metric_col], metric_coerced)
     if bad_metric:
@@ -377,7 +328,6 @@ try:
         st.stop()
     data[metric_col] = metric_coerced
 
-    # Coerce regressors
     for reg_col in regressor_cols:
         reg_coerced = coerce_numeric_allow_blanks(data[reg_col])
         bad_reg = find_true_non_numeric_examples(data[reg_col], reg_coerced)
@@ -389,29 +339,32 @@ try:
     st.info(f"Date column: '{date_col}', Metric column: '{metric_col}'")
     st.info(f"Regressors: {', '.join(regressor_cols) if regressor_cols else '(none)'}")
 
-    df = data.rename(columns={date_col: "ds", metric_col: "y"}).copy()
+    df = data.rename(columns={date_col: "ds", metric_col: "y_raw"}).copy()
     df = df.sort_values("ds").reset_index(drop=True)
 
-    st.write("Processed Data (pre-resample):", df.head())
+    # Apply target transform (model scale)
+    df["y"] = safe_log1p(df["y_raw"]) if use_log_y else df["y_raw"]
+
+    # Frequency
+    if freq_choice == "Infer Automatically":
+        inferred = pd.infer_freq(df["ds"])
+        if inferred:
+            freq = inferred
+            st.info(f"Inferred frequency: {freq}")
+        else:
+            freq = "D"
+            st.warning("Could not infer frequency. Defaulting to Daily ('D').")
+    else:
+        freq_map = {"Daily": "D", "Weekly": "W", "Monthly": "M", "Yearly": "Y"}
+        freq = freq_map[freq_choice]
+
+    st.write("Processed Data (pre-resample):", df[["ds", "y_raw", "y"] + regressor_cols].head())
 
     if not st.session_state.run_forecast:
         st.info("Configure options in the sidebar, then click **Run Forecast**.")
         st.stop()
 
     with st.spinner("Running forecast..."):
-        # Resolve frequency
-        if freq_choice == "Infer Automatically":
-            inferred = pd.infer_freq(df["ds"])
-            if inferred:
-                freq = inferred
-                st.info(f"Inferred frequency: {freq}")
-            else:
-                freq = "D"
-                st.warning("Could not infer frequency. Defaulting to Daily ('D').")
-        else:
-            freq_map = {"Daily": "D", "Weekly": "W", "Monthly": "M", "Yearly": "Y"}
-            freq = freq_map[freq_choice]
-
         # Resample
         df = df.set_index("ds").asfreq(freq).reset_index()
 
@@ -425,20 +378,19 @@ try:
                     )
                     df[reg_col] = df[reg_col].ffill().bfill()
 
-        st.write(f"Data resampled to {freq} frequency:")
-        st.dataframe(df.head())
-
-        # Split train vs future blanks
-        train_df = df[df["y"].notna()].copy()
-        missing_future_df = df[df["y"].isna()].copy()
+        # Split train vs future blanks (based on raw y)
+        train_df = df[df["y_raw"].notna()].copy()
+        missing_future_df = df[df["y_raw"].isna()].copy()
 
         if train_df.empty:
             st.error("No historical (non-null) metric values found to train on.")
             st.stop()
 
+        # Model with regressors (main)
         model = Prophet(
             changepoint_prior_scale=changepoint_prior_scale,
             seasonality_prior_scale=seasonality_prior_scale,
+            seasonality_mode=seasonality_mode,
         )
 
         for reg_col in regressor_cols:
@@ -449,9 +401,9 @@ try:
             model.changepoints = cps
             st.write("Using manual changepoints:", cps)
 
-        model.fit(train_df)
+        model.fit(train_df[["ds", "y"] + regressor_cols])
 
-        # Future
+        # Future dataframe for prediction
         if not missing_future_df.empty:
             future = missing_future_df[["ds"] + regressor_cols].copy()
             st.info(f"Detected {len(missing_future_df)} blank metric rows. Forecasting those dates from your file.")
@@ -463,12 +415,23 @@ try:
 
         forecast = model.predict(future)
 
-        # Combine
-        hist = df[["ds", "y"]].copy()
+        # Convert yhat back to raw scale for display if log used
         pred = forecast[["ds", "yhat", "yhat_lower", "yhat_upper"]].copy()
-        combined = pd.merge(hist, pred, on="ds", how="outer").sort_values("ds")
+        pred["ds"] = pd.to_datetime(pred["ds"])
 
-        combined["final"] = combined["y"].combine_first(combined["yhat"])
+        if use_log_y:
+            pred["yhat_raw"] = safe_expm1(pred["yhat"])
+            pred["yhat_lower_raw"] = safe_expm1(pred["yhat_lower"])
+            pred["yhat_upper_raw"] = safe_expm1(pred["yhat_upper"])
+        else:
+            pred["yhat_raw"] = pred["yhat"]
+            pred["yhat_lower_raw"] = pred["yhat_lower"]
+            pred["yhat_upper_raw"] = pred["yhat_upper"]
+
+        # Combine history + predictions for matrix, using raw scale
+        hist = df[["ds", "y_raw"]].copy()
+        combined = pd.merge(hist, pred[["ds", "yhat_raw", "yhat_lower_raw", "yhat_upper_raw"]], on="ds", how="outer").sort_values("ds")
+        combined["final"] = combined["y_raw"].combine_first(combined["yhat_raw"])
         combined["year"] = combined["ds"].dt.year
         combined["month"] = combined["ds"].dt.month
 
@@ -497,18 +460,19 @@ try:
         st.plotly_chart(fig_decomp, use_container_width=True)
 
         # -----------------------
-        # Backtest (cached + normalized)
+        # Backtest (main model; cached)
         # -----------------------
         cv_df = None
         perf_df = None
 
         if run_backtest:
-            st.subheader("Backtest Results")
+            st.subheader("Backtest Results (Main model)")
 
             current_params = bt_params_tuple(
                 bt_initial_days, bt_period_days, bt_horizon_days,
                 freq, regressor_cols,
-                changepoint_prior_scale, seasonality_prior_scale, manual_changepoints
+                changepoint_prior_scale, seasonality_prior_scale, manual_changepoints,
+                seasonality_mode, use_log_y
             )
 
             recompute = (
@@ -519,13 +483,12 @@ try:
 
             colR1, _ = st.columns([1, 3])
             with colR1:
-                if st.button("Recompute backtest"):
+                if st.button("Recompute main backtest"):
                     recompute = True
 
             if recompute:
                 train_span_days = (train_df["ds"].max() - train_df["ds"].min()).days
                 needed = int(bt_initial_days + bt_horizon_days + bt_period_days)
-
                 if train_span_days < needed:
                     st.warning(
                         f"Not enough historical span for these backtest windows. "
@@ -533,7 +496,7 @@ try:
                         f"Reduce initial/horizon/period."
                     )
                 else:
-                    with st.spinner("Running backtest cross-validation (this can be slow)..."):
+                    with st.spinner("Running main CV..."):
                         initial = f"{int(bt_initial_days)} days"
                         period = f"{int(bt_period_days)} days"
                         horizon = f"{int(bt_horizon_days)} days"
@@ -546,15 +509,12 @@ try:
                             parallel=None,
                         )
                         perf_df = performance_metrics(cv_df)
-
-                        # Normalize 'horizon' across versions
                         cv_df, perf_df = normalize_backtest_frames(cv_df, perf_df)
 
                         st.session_state.bt_cv_df = cv_df
                         st.session_state.bt_perf_df = perf_df
                         st.session_state.bt_params = current_params
 
-            # Load from cache (and normalize again just in case)
             cv_df = st.session_state.bt_cv_df
             perf_df = st.session_state.bt_perf_df
             cv_df, perf_df = normalize_backtest_frames(cv_df, perf_df)
@@ -562,37 +522,191 @@ try:
             st.session_state.bt_perf_df = perf_df
 
             if cv_df is None or perf_df is None or cv_df.empty or perf_df.empty:
-                st.info("Backtest results are not available yet (not enough data or computation skipped).")
+                st.info("Backtest results unavailable.")
             else:
-                with st.expander("Cross-validation predictions (sample)"):
+                with st.expander("CV predictions (sample)"):
                     st.dataframe(cv_df.head(50))
-
-                with st.expander("Performance metrics table"):
+                with st.expander("Performance metrics"):
                     st.dataframe(perf_df)
-
-                # Metric charts (no dropdown selector)
-                metric_candidates = ["mape", "mae", "rmse", "mdape", "smape", "coverage"]
-                available_metrics = [m for m in metric_candidates if m in perf_df.columns]
-                if available_metrics:
-                    st.markdown("**Metric trends vs horizon**")
-                    tabs = st.tabs([m.upper() for m in available_metrics])
-                    for tab, m in zip(tabs, available_metrics):
-                        with tab:
-                            fig = px.line(
-                                perf_df, x="horizon", y=m,
-                                labels={"horizon": "Horizon", m: m.upper()},
-                                title=f"{m.upper()} vs Horizon"
-                            )
-                            st.plotly_chart(fig, use_container_width=True)
-
-                # Interpretable views
                 render_interpretable_backtest_views(cv_df)
+
+        # -----------------------
+        # Baseline tests (trend reliability)
+        # -----------------------
+        if run_baseline_tests:
+            st.header("Baseline tests")
+
+            st.caption(
+                "These tests treat baseline as the model trend. If baseline is unstable here, it will be unreliable in planning."
+            )
+
+            # 1) Baseline vs Actual (history)
+            st.subheader("Baseline vs Actual (history)")
+            baseline_hist = compute_baseline_history_view(model, train_df[["ds", "y"] + regressor_cols], regressor_cols, use_log_y)
+            st.dataframe(baseline_hist.head(30))
+
+            fig_base = px.line(
+                baseline_hist,
+                x="ds",
+                y=["y_actual", "baseline"],
+                labels={"value": "Metric", "variable": ""},
+                title="History: Actual vs Baseline (trend)"
+            )
+            st.plotly_chart(fig_base, use_container_width=True)
+
+            fig_ratio = px.line(
+                baseline_hist,
+                x="ds",
+                y="ratio_actual_to_baseline",
+                labels={"ratio_actual_to_baseline": "Actual / Baseline"},
+                title="History: Actual divided by Baseline (trend)"
+            )
+            st.plotly_chart(fig_ratio, use_container_width=True)
+
+            # 2) Baseline-only CV (no regressors)
+            if run_backtest:
+                st.subheader("Baseline-only backtest (no regressors)")
+
+                base_params = (
+                    bt_initial_days, bt_period_days, bt_horizon_days, freq,
+                    changepoint_prior_scale, seasonality_prior_scale, seasonality_mode, use_log_y
+                )
+                recompute_base = (
+                    st.session_state.bt_cv_base_df is None
+                    or st.session_state.bt_perf_base_df is None
+                    or st.session_state.bt_base_params != base_params
+                )
+
+                colB1, _ = st.columns([1, 3])
+                with colB1:
+                    if st.button("Recompute baseline-only CV"):
+                        recompute_base = True
+
+                if recompute_base:
+                    with st.spinner("Running baseline-only CV (no regressors)..."):
+                        base_model, cv_base, perf_base = run_baseline_only_cv(
+                            train_df_model_scale=train_df[["ds", "y"]],
+                            freq=freq,
+                            cps=changepoint_prior_scale,
+                            sps=seasonality_prior_scale,
+                            seasonality_mode=seasonality_mode,
+                            bt_initial_days=int(bt_initial_days),
+                            bt_period_days=int(bt_period_days),
+                            bt_horizon_days=int(bt_horizon_days),
+                        )
+                        st.session_state.bt_cv_base_df = cv_base
+                        st.session_state.bt_perf_base_df = perf_base
+                        st.session_state.bt_base_params = base_params
+
+                cv_base = st.session_state.bt_cv_base_df
+                perf_base = st.session_state.bt_perf_base_df
+                cv_base, perf_base = normalize_backtest_frames(cv_base, perf_base)
+                st.session_state.bt_cv_base_df = cv_base
+                st.session_state.bt_perf_base_df = perf_base
+
+                if cv_base is None or perf_base is None or cv_base.empty or perf_base.empty:
+                    st.info("Baseline-only CV unavailable.")
+                else:
+                    with st.expander("Baseline-only performance metrics"):
+                        st.dataframe(perf_base)
+
+                    # If on log scale, convert CV outputs to raw for interpretability
+                    cvb = cv_base.copy()
+                    if use_log_y:
+                        # cv outputs are in model scale; convert y and yhat back
+                        for col in ["y", "yhat", "yhat_lower", "yhat_upper"]:
+                            if col in cvb.columns:
+                                cvb[col + "_raw"] = safe_expm1(cvb[col].astype(float))
+                        y_col = "y_raw" if "y_raw" in cvb.columns else "y"
+                        yhat_col = "yhat_raw" if "yhat_raw" in cvb.columns else "yhat"
+                    else:
+                        y_col = "y"
+                        yhat_col = "yhat"
+
+                    cvb["abs_err_raw"] = (cvb[y_col] - cvb[yhat_col]).abs()
+                    fig_cvb = px.line(
+                        cvb.sort_values("ds"),
+                        x="ds",
+                        y="abs_err_raw",
+                        labels={"abs_err_raw": "Absolute error"},
+                        title="Baseline-only CV: absolute error over time"
+                    )
+                    st.plotly_chart(fig_cvb, use_container_width=True)
+
+            # 3) Stability sweep (trend sensitivity to CPS)
+            st.subheader("Baseline stability sweep (trend sensitivity)")
+            # choose cps values around current CPS
+            base = float(changepoint_prior_scale)
+            if sweep_points == 3:
+                cps_values = sorted({max(0.001, base * 0.5), base, min(1.0, base * 2.0)})
+            elif sweep_points == 5:
+                cps_values = sorted({
+                    max(0.001, base * 0.25),
+                    max(0.001, base * 0.5),
+                    base,
+                    min(1.0, base * 1.5),
+                    min(1.0, base * 2.0),
+                })
+            else:
+                cps_values = sorted({
+                    max(0.001, base * 0.2),
+                    max(0.001, base * 0.4),
+                    max(0.001, base * 0.7),
+                    base,
+                    min(1.0, base * 1.3),
+                    min(1.0, base * 1.7),
+                    min(1.0, base * 2.2),
+                })
+
+            hist_ds = train_df["ds"].sort_values().reset_index(drop=True)
+            trend_mat = stability_sweep_trends(
+                train_df_model_scale=train_df[["ds", "y"]],
+                cps_values=cps_values,
+                sps=seasonality_prior_scale,
+                seasonality_mode=seasonality_mode,
+                hist_ds=hist_ds
+            )
+            trend_mean = trend_mat.mean(axis=1)
+            trend_std = trend_mat.std(axis=1)
+            # Stability score: median coefficient of variation of trend (lower is more stable)
+            denom = trend_mean.replace(0, np.nan).abs()
+            stability_cv = (trend_std / denom).replace([np.inf, -np.inf], np.nan)
+            stability_score = float(np.nanmedian(stability_cv.values))
+
+            st.metric("Baseline stability score (median CV of trend)", f"{stability_score:.4f}")
+
+            # Convert to raw scale if log used
+            if use_log_y:
+                plot_df = pd.DataFrame({"ds": hist_ds})
+                for col in trend_mat.columns:
+                    plot_df[f"trend_cps_{col}"] = safe_expm1(trend_mat[col].astype(float).values)
+                plot_df["trend_mean"] = safe_expm1(trend_mean.astype(float).values)
+            else:
+                plot_df = pd.DataFrame({"ds": hist_ds})
+                for col in trend_mat.columns:
+                    plot_df[f"trend_cps_{col}"] = trend_mat[col].astype(float).values
+                plot_df["trend_mean"] = trend_mean.astype(float).values
+
+            # Long format for plotting multiple lines
+            line_cols = [c for c in plot_df.columns if c.startswith("trend_cps_")]
+            long_trend = plot_df.melt(id_vars="ds", value_vars=line_cols, var_name="variant", value_name="baseline")
+            long_trend["variant"] = long_trend["variant"].str.replace("trend_cps_", "CPS=")
+
+            fig_sweep = px.line(
+                long_trend,
+                x="ds",
+                y="baseline",
+                color="variant",
+                title="Baseline (trend) across CPS variants (baseline-only models)"
+            )
+            st.plotly_chart(fig_sweep, use_container_width=True)
 
         # -----------------------
         # Prepare download ZIP
         # -----------------------
         buffer = io.BytesIO()
         with zipfile.ZipFile(buffer, "w") as zf:
+            # core outputs
             csv_combined = io.StringIO()
             combined.to_csv(csv_combined, index=False)
             zf.writestr("combined_data.csv", csv_combined.getvalue())
@@ -605,15 +719,28 @@ try:
             zf.writestr("forecast.html", to_html(fig_forecast, full_html=True, include_plotlyjs="cdn"))
             zf.writestr("components.html", to_html(fig_decomp, full_html=True, include_plotlyjs="cdn"))
 
-            if run_backtest and cv_df is not None:
+            # backtest exports
+            if run_backtest and cv_df is not None and perf_df is not None:
                 csv_cv = io.StringIO()
                 cv_df.to_csv(csv_cv, index=False)
                 zf.writestr("backtest_cv_predictions.csv", csv_cv.getvalue())
 
-            if run_backtest and perf_df is not None:
                 csv_perf = io.StringIO()
                 perf_df.to_csv(csv_perf, index=False)
                 zf.writestr("backtest_performance_metrics.csv", csv_perf.getvalue())
+
+            # baseline-only cv exports
+            if run_baseline_tests and run_backtest:
+                cv_base = st.session_state.bt_cv_base_df
+                perf_base = st.session_state.bt_perf_base_df
+                if cv_base is not None and perf_base is not None:
+                    csv_cvb = io.StringIO()
+                    cv_base.to_csv(csv_cvb, index=False)
+                    zf.writestr("baseline_only_backtest_cv_predictions.csv", csv_cvb.getvalue())
+
+                    csv_perfb = io.StringIO()
+                    perf_base.to_csv(csv_perfb, index=False)
+                    zf.writestr("baseline_only_backtest_performance_metrics.csv", csv_perfb.getvalue())
 
         buffer.seek(0)
         st.success("Done. Download your results below.")
@@ -624,7 +751,7 @@ try:
             mime="application/zip",
         )
 
-    # Don’t rerun the whole forecast on every widget rerun
+    # prevent accidental reruns
     st.session_state.run_forecast = False
 
 except Exception as e:
