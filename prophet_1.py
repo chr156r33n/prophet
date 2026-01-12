@@ -289,57 +289,139 @@ if uploaded_file:
                 st.plotly_chart(fig_decomp, use_container_width=True)
 
                 # -----------------------
-                # Backtest
+                # Backtest (Cross-Validation) - CACHED + BETTER UI
                 # -----------------------
                 cv_df = None
                 perf_df = None
                 fig_bt = None
-
+                
+                # Session state keys
+                if "bt_cv_df" not in st.session_state:
+                    st.session_state.bt_cv_df = None
+                if "bt_perf_df" not in st.session_state:
+                    st.session_state.bt_perf_df = None
+                if "bt_params" not in st.session_state:
+                    st.session_state.bt_params = None
+                
+                def _bt_params_tuple():
+                    return (
+                        int(bt_initial_days),
+                        int(bt_period_days),
+                        int(bt_horizon_days),
+                        freq,  # include freq since it can affect resampling cadence and thus outcomes
+                        tuple(regressor_cols),
+                        float(changepoint_prior_scale),
+                        float(seasonality_prior_scale),
+                        manual_changepoints.strip(),
+                    )
+                
                 if run_backtest:
-                    train_span_days = (train_df["ds"].max() - train_df["ds"].min()).days
-                    needed = int(bt_initial_days + bt_horizon_days + bt_period_days)
-
-                    if train_span_days < needed:
-                        st.warning(
-                            f"Not enough historical span for these backtest windows. "
-                            f"Train span ≈ {train_span_days} days; need at least ≈ {needed} days. "
-                            f"Reduce initial/horizon/period."
-                        )
-                    else:
-                        with st.spinner("Running backtest cross-validation (this can be slow)..."):
-                            initial = f"{int(bt_initial_days)} days"
-                            period = f"{int(bt_period_days)} days"
-                            horizon = f"{int(bt_horizon_days)} days"
-
-                            cv_df = cross_validation(
-                                model,
-                                initial=initial,
-                                period=period,
-                                horizon=horizon,
-                                parallel=None,
+                    st.subheader("Backtest Results")
+                
+                    # Decide whether to recompute:
+                    # - If no cached results
+                    # - Or params changed
+                    # - Or user explicitly requests recompute
+                    recompute = False
+                
+                    current_params = _bt_params_tuple()
+                    if st.session_state.bt_cv_df is None or st.session_state.bt_perf_df is None:
+                        recompute = True
+                    elif st.session_state.bt_params != current_params:
+                        recompute = True
+                
+                    colR1, colR2 = st.columns([1, 3])
+                    with colR1:
+                        force_recompute = st.button("Recompute backtest")
+                        if force_recompute:
+                            recompute = True
+                
+                    if recompute:
+                        # Sanity check: backtest uses ONLY training data
+                        train_span_days = (train_df["ds"].max() - train_df["ds"].min()).days
+                        needed = int(bt_initial_days + bt_horizon_days + bt_period_days)
+                
+                        if train_span_days < needed:
+                            st.warning(
+                                f"Not enough historical span for these backtest windows. "
+                                f"Train span ≈ {train_span_days} days; need at least ≈ {needed} days. "
+                                f"Reduce initial/horizon/period."
                             )
-                            perf_df = performance_metrics(cv_df)
-
-                        st.subheader("Backtest Results")
-                        st.write("Cross-validation predictions (sample):")
-                        st.dataframe(cv_df.head(30))
-
-                        st.write("Performance metrics:")
-                        st.dataframe(perf_df)
-
-                        metric_choice = st.selectbox(
-                            "Backtest metric to plot",
-                            [c for c in ["mape", "mae", "rmse", "mdape", "smape", "coverage"] if c in perf_df.columns],
-                            index=0
-                        )
-                        fig_bt = px.line(
-                            perf_df,
-                            x="horizon",
-                            y=metric_choice,
-                            labels={"horizon": "Horizon", metric_choice: metric_choice.upper()},
-                            title=f"{metric_choice.upper()} vs Horizon"
-                        )
-                        st.plotly_chart(fig_bt, use_container_width=True)
+                        else:
+                            with st.spinner("Running backtest cross-validation (this can be slow)..."):
+                                initial = f"{int(bt_initial_days)} days"
+                                period = f"{int(bt_period_days)} days"
+                                horizon = f"{int(bt_horizon_days)} days"
+                
+                                # cross_validation re-fits internally using the provided fitted model spec
+                                cv_df = cross_validation(
+                                    model,
+                                    initial=initial,
+                                    period=period,
+                                    horizon=horizon,
+                                    parallel=None,
+                                )
+                                perf_df = performance_metrics(cv_df)
+                
+                                # Cache results
+                                st.session_state.bt_cv_df = cv_df
+                                st.session_state.bt_perf_df = perf_df
+                                st.session_state.bt_params = current_params
+                
+                    # Pull from cache (whether newly computed or already there)
+                    cv_df = st.session_state.bt_cv_df
+                    perf_df = st.session_state.bt_perf_df
+                
+                    if cv_df is None or perf_df is None:
+                        st.info("Backtest results are not available yet (not enough data or computation skipped).")
+                    else:
+                        # Show summary + data
+                        with st.expander("Cross-validation predictions (sample)"):
+                            st.dataframe(cv_df.head(50))
+                
+                        with st.expander("Performance metrics table"):
+                            st.dataframe(perf_df)
+                
+                        # Present charts without any post-run selector widgets.
+                        # Tabs are still widgets, but they only re-render; no expensive recompute because data is cached.
+                        metric_candidates = ["mape", "mae", "rmse", "mdape", "smape", "coverage"]
+                        available_metrics = [m for m in metric_candidates if m in perf_df.columns]
+                
+                        if not available_metrics:
+                            st.info("No standard metrics found in performance metrics output.")
+                        else:
+                            st.markdown("**Metric trends vs horizon**")
+                            tabs = st.tabs([m.upper() for m in available_metrics])
+                
+                            for tab, m in zip(tabs, available_metrics):
+                                with tab:
+                                    fig = px.line(
+                                        perf_df,
+                                        x="horizon",
+                                        y=m,
+                                        labels={"horizon": "Horizon", m: m.upper()},
+                                        title=f"{m.upper()} vs Horizon",
+                                    )
+                                    st.plotly_chart(fig, use_container_width=True)
+                
+                        # Optional: a single consolidated view to avoid multiple figures
+                        with st.expander("Consolidated metrics (long format)"):
+                            long_perf = perf_df[["horizon"] + available_metrics].melt(
+                                id_vars="horizon", var_name="metric", value_name="value"
+                            )
+                            fig_all = px.line(
+                                long_perf,
+                                x="horizon",
+                                y="value",
+                                color="metric",
+                                labels={"horizon": "Horizon", "value": "Metric value", "metric": "Metric"},
+                                title="All backtest metrics vs horizon",
+                            )
+                            st.plotly_chart(fig_all, use_container_width=True)
+                
+                else:
+                    # If user unticks backtest, keep cached results around quietly.
+                    pass
 
                 # -----------------------
                 # Prepare download ZIP
