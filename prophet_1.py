@@ -30,6 +30,28 @@ def ensure_timedelta_days(td_series: pd.Series) -> pd.Series:
         return td_series.dt.total_seconds() / 86400.0
     return td_series
 
+def normalize_backtest_frames(cv_df: pd.DataFrame | None, perf_df: pd.DataFrame | None):
+    """
+    Ensure both cv_df and perf_df have a real 'horizon' column.
+    Prophet/prophet-diagnostics can return 'horizon' as an index depending on version.
+    """
+    if cv_df is not None and not cv_df.empty:
+        if "horizon" not in cv_df.columns:
+            if getattr(cv_df.index, "name", None) == "horizon":
+                cv_df = cv_df.reset_index()
+            elif "cutoff" in cv_df.columns and "ds" in cv_df.columns:
+                cv_df = cv_df.copy()
+                cv_df["horizon"] = pd.to_datetime(cv_df["ds"]) - pd.to_datetime(cv_df["cutoff"])
+
+    if perf_df is not None and not perf_df.empty:
+        if "horizon" not in perf_df.columns:
+            if getattr(perf_df.index, "name", None) == "horizon":
+                perf_df = perf_df.reset_index()
+            else:
+                perf_df = perf_df.reset_index()
+
+    return cv_df, perf_df
+
 def bt_params_tuple(bt_initial_days, bt_period_days, bt_horizon_days, freq, regressor_cols,
                     changepoint_prior_scale, seasonality_prior_scale, manual_changepoints):
     return (
@@ -47,23 +69,51 @@ def render_interpretable_backtest_views(cv_df: pd.DataFrame):
     st.subheader("Backtest: Interpretable Views")
 
     cv = cv_df.copy()
+    if "horizon" not in cv.columns:
+        st.warning("Backtest output is missing 'horizon' even after normalization. Skipping interpretable views.")
+        return
 
     # Standard Prophet CV cols: ds, y, yhat, yhat_lower, yhat_upper, cutoff, horizon
+    needed_cols = {"ds", "y", "yhat"}
+    if not needed_cols.issubset(set(cv.columns)):
+        st.warning(f"Backtest output is missing required columns: {needed_cols - set(cv.columns)}")
+        return
+
+    # Make sure dates are datetime
+    cv["ds"] = pd.to_datetime(cv["ds"], errors="coerce")
+    if "cutoff" in cv.columns:
+        cv["cutoff"] = pd.to_datetime(cv["cutoff"], errors="coerce")
+
+    # Errors
     cv["abs_err"] = (cv["y"] - cv["yhat"]).abs()
     cv["err"] = (cv["y"] - cv["yhat"])
-    cv["ape"] = (cv["abs_err"] / cv["y"].replace(0, np.nan)).astype(float)
-    cv["in_80"] = (cv["y"] >= cv["yhat_lower"]) & (cv["y"] <= cv["yhat_upper"])
 
-    cv["horizon_days"] = ensure_timedelta_days(cv["horizon"])
-    cv["month"] = pd.to_datetime(cv["ds"]).dt.month
-    cv["year"] = pd.to_datetime(cv["ds"]).dt.year
+    # Intervals if present
+    if "yhat_lower" in cv.columns and "yhat_upper" in cv.columns:
+        cv["in_80"] = (cv["y"] >= cv["yhat_lower"]) & (cv["y"] <= cv["yhat_upper"])
+    else:
+        cv["in_80"] = np.nan
+
+    # APE
+    cv["ape"] = (cv["abs_err"] / cv["y"].replace(0, np.nan)).astype(float)
+
+    # Horizon days
+    try:
+        cv["horizon_days"] = ensure_timedelta_days(cv["horizon"])
+    except Exception:
+        # If horizon is not timedelta, attempt coercion
+        cv["horizon_days"] = pd.to_numeric(cv["horizon"], errors="coerce")
+
+    cv["month"] = cv["ds"].dt.month
+    cv["year"] = cv["ds"].dt.year
 
     # 1) Scorecard
     mape = float(cv["ape"].dropna().mean() * 100) if cv["ape"].notna().any() else np.nan
     median_ape = float(cv["ape"].dropna().median() * 100) if cv["ape"].notna().any() else np.nan
     mae = float(cv["abs_err"].mean()) if cv["abs_err"].notna().any() else np.nan
     median_abs = float(cv["abs_err"].median()) if cv["abs_err"].notna().any() else np.nan
-    coverage = float(cv["in_80"].mean() * 100) if cv["in_80"].notna().any() else np.nan
+
+    coverage = float(cv["in_80"].dropna().mean() * 100) if cv["in_80"].notna().any() else np.nan
     within_10 = float((cv["ape"] <= 0.10).mean() * 100) if cv["ape"].notna().any() else np.nan
     within_20 = float((cv["ape"] <= 0.20).mean() * 100) if cv["ape"].notna().any() else np.nan
 
@@ -87,14 +137,15 @@ def render_interpretable_backtest_views(cv_df: pd.DataFrame):
         )
         st.plotly_chart(fig_cv, use_container_width=True)
 
-        fig_bounds = px.line(
-            cv_plot,
-            x="ds",
-            y=["yhat_lower", "yhat_upper"],
-            labels={"value": "Metric", "variable": ""},
-            title="CV: Prediction interval bounds (lower/upper)",
-        )
-        st.plotly_chart(fig_bounds, use_container_width=True)
+        if "yhat_lower" in cv_plot.columns and "yhat_upper" in cv_plot.columns:
+            fig_bounds = px.line(
+                cv_plot,
+                x="ds",
+                y=["yhat_lower", "yhat_upper"],
+                labels={"value": "Metric", "variable": ""},
+                title="CV: Prediction interval bounds (lower/upper)",
+            )
+            st.plotly_chart(fig_bounds, use_container_width=True)
 
     # 3) Error over time
     with st.expander("Error over time (absolute and % error)", expanded=True):
@@ -131,8 +182,14 @@ def render_interpretable_backtest_views(cv_df: pd.DataFrame):
             median_ape=("ape", lambda s: float(s.dropna().median() * 100) if s.notna().any() else np.nan),
             mae=("abs_err", "mean"),
             median_abs=("abs_err", "median"),
-            coverage=("in_80", lambda s: float(s.mean() * 100)),
         ).reset_index()
+
+        if "in_80" in cv.columns and cv["in_80"].notna().any():
+            cov = cv.groupby("h_bucket", dropna=False)["in_80"].mean().reset_index(name="coverage")
+            cov["coverage"] = cov["coverage"] * 100
+            bucket = bucket.merge(cov, on="h_bucket", how="left")
+        else:
+            bucket["coverage"] = np.nan
 
         st.dataframe(bucket)
 
@@ -254,20 +311,14 @@ for k, v in {
 
 with st.sidebar.form("config_form", clear_on_submit=False):
     st.subheader("Model")
-    changepoint_prior_scale = st.slider(
-        "Changepoint Prior Scale", 0.0, 1.0, 0.05, 0.01
-    )
-    seasonality_prior_scale = st.slider(
-        "Seasonality Prior Scale", 1.0, 20.0, 10.0, 0.5
-    )
+    changepoint_prior_scale = st.slider("Changepoint Prior Scale", 0.0, 1.0, 0.05, 0.01)
+    seasonality_prior_scale = st.slider("Seasonality Prior Scale", 1.0, 20.0, 10.0, 0.5)
     manual_changepoints = st.text_area(
         "Manual Changepoints (comma-separated dates, e.g., 2024-01-01,2024-06-01)", ""
     )
 
     st.subheader("Data frequency & horizon")
-    freq_choice = st.selectbox(
-        "Frequency", ["Infer Automatically", "Daily", "Weekly", "Monthly", "Yearly"], 0
-    )
+    freq_choice = st.selectbox("Frequency", ["Infer Automatically", "Daily", "Weekly", "Monthly", "Yearly"], 0)
     forecast_periods = st.number_input(
         "Future periods to forecast (only used if file has no blank future metric rows)",
         min_value=0, value=0, step=1
@@ -293,13 +344,13 @@ uploaded_file = st.file_uploader(
     type=["csv"]
 )
 
-# ----------------------------
-# Main logic
-# ----------------------------
 if not uploaded_file:
     st.info("Upload a CSV to begin.")
     st.stop()
 
+# ----------------------------
+# Main logic
+# ----------------------------
 try:
     data = pd.read_csv(uploaded_file)
     st.write("Uploaded Data Preview:", data.head())
@@ -446,7 +497,7 @@ try:
         st.plotly_chart(fig_decomp, use_container_width=True)
 
         # -----------------------
-        # Backtest (cached)
+        # Backtest (cached + normalized)
         # -----------------------
         cv_df = None
         perf_df = None
@@ -466,7 +517,7 @@ try:
                 or st.session_state.bt_params != current_params
             )
 
-            colR1, colR2 = st.columns([1, 3])
+            colR1, _ = st.columns([1, 3])
             with colR1:
                 if st.button("Recompute backtest"):
                     recompute = True
@@ -496,15 +547,21 @@ try:
                         )
                         perf_df = performance_metrics(cv_df)
 
+                        # Normalize 'horizon' across versions
+                        cv_df, perf_df = normalize_backtest_frames(cv_df, perf_df)
+
                         st.session_state.bt_cv_df = cv_df
                         st.session_state.bt_perf_df = perf_df
                         st.session_state.bt_params = current_params
 
-            # Load from cache
+            # Load from cache (and normalize again just in case)
             cv_df = st.session_state.bt_cv_df
             perf_df = st.session_state.bt_perf_df
+            cv_df, perf_df = normalize_backtest_frames(cv_df, perf_df)
+            st.session_state.bt_cv_df = cv_df
+            st.session_state.bt_perf_df = perf_df
 
-            if cv_df is None or perf_df is None or cv_df.empty:
+            if cv_df is None or perf_df is None or cv_df.empty or perf_df.empty:
                 st.info("Backtest results are not available yet (not enough data or computation skipped).")
             else:
                 with st.expander("Cross-validation predictions (sample)"):
@@ -513,7 +570,7 @@ try:
                 with st.expander("Performance metrics table"):
                     st.dataframe(perf_df)
 
-                # Simple metric charts (no selector)
+                # Metric charts (no dropdown selector)
                 metric_candidates = ["mape", "mae", "rmse", "mdape", "smape", "coverage"]
                 available_metrics = [m for m in metric_candidates if m in perf_df.columns]
                 if available_metrics:
@@ -528,7 +585,7 @@ try:
                             )
                             st.plotly_chart(fig, use_container_width=True)
 
-                # Interpretable views (the part you kept putting in the wrong place)
+                # Interpretable views
                 render_interpretable_backtest_views(cv_df)
 
         # -----------------------
@@ -567,7 +624,7 @@ try:
             mime="application/zip",
         )
 
-    # Don’t rerun the whole forecast just because the app reran.
+    # Don’t rerun the whole forecast on every widget rerun
     st.session_state.run_forecast = False
 
 except Exception as e:
