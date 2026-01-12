@@ -423,6 +423,179 @@ if uploaded_file:
                     # If user unticks backtest, keep cached results around quietly.
                     pass
 
+def _ensure_timedelta_days(td_series):
+    # Prophet CV uses Timedelta for horizon; this converts to numeric days
+    if np.issubdtype(td_series.dtype, np.timedelta64):
+        return td_series.dt.total_seconds() / 86400.0
+    return td_series
+
+if cv_df is not None and perf_df is not None and not cv_df.empty:
+    st.subheader("Backtest: Interpretable Views")
+
+                    # -----
+                    # Prep a friendly CV frame
+                    # -----
+                    cv = cv_df.copy()
+                    # Standard Prophet CV cols: ds, y, yhat, yhat_lower, yhat_upper, cutoff, horizon
+                    cv["abs_err"] = (cv["y"] - cv["yhat"]).abs()
+                    cv["err"] = (cv["y"] - cv["yhat"])
+                    cv["ape"] = (cv["abs_err"] / cv["y"].replace(0, np.nan)).astype(float)
+                    cv["in_80"] = (cv["y"] >= cv["yhat_lower"]) & (cv["y"] <= cv["yhat_upper"])
+                
+                    cv["horizon_days"] = _ensure_timedelta_days(cv["horizon"])
+                    cv["month"] = pd.to_datetime(cv["ds"]).dt.month
+                    cv["year"] = pd.to_datetime(cv["ds"]).dt.year
+                
+                    # -----
+                    # 1) Scorecard summary (simple + relatable)
+                    # -----
+                    mape = float((cv["ape"].dropna().mean()) * 100) if cv["ape"].notna().any() else np.nan
+                    median_ape = float((cv["ape"].dropna().median()) * 100) if cv["ape"].notna().any() else np.nan
+                    mae = float(cv["abs_err"].mean())
+                    median_abs = float(cv["abs_err"].median())
+                    coverage = float(cv["in_80"].mean() * 100)
+                
+                    # "within X%" shares
+                    within_10 = float((cv["ape"] <= 0.10).mean() * 100) if cv["ape"].notna().any() else np.nan
+                    within_20 = float((cv["ape"] <= 0.20).mean() * 100) if cv["ape"].notna().any() else np.nan
+                
+                    c1, c2, c3, c4, c5, c6 = st.columns(6)
+                    c1.metric("MAPE (avg)", f"{mape:.1f}%" if np.isfinite(mape) else "n/a")
+                    c2.metric("APE (median)", f"{median_ape:.1f}%" if np.isfinite(median_ape) else "n/a")
+                    c3.metric("MAE (avg)", f"{mae:,.2f}" if np.isfinite(mae) else "n/a")
+                    c4.metric("Abs Err (median)", f"{median_abs:,.2f}" if np.isfinite(median_abs) else "n/a")
+                    c5.metric("Within ±10%", f"{within_10:.1f}%" if np.isfinite(within_10) else "n/a")
+                    c6.metric("80% band coverage", f"{coverage:.1f}%")
+                
+                    # -----
+                    # 2) Actual vs Predicted (CV points) with band
+                    # -----
+                    with st.expander("Actual vs Predicted (CV predictions)", expanded=True):
+                        cv_plot = cv.sort_values("ds").copy()
+                        fig_cv = px.line(
+                            cv_plot,
+                            x="ds",
+                            y=["y", "yhat"],
+                            labels={"value": "Metric", "variable": ""},
+                            title="CV: Actual vs Predicted (y vs yhat)"
+                        )
+                        st.plotly_chart(fig_cv, use_container_width=True)
+                
+                        # Optional: show uncertainty band via filled area technique (Plotly Express doesn't do it automatically)
+                        # Keeping it simple: separate chart for bounds
+                        fig_bounds = px.line(
+                            cv_plot,
+                            x="ds",
+                            y=["yhat_lower", "yhat_upper"],
+                            labels={"value": "Metric", "variable": ""},
+                            title="CV: Prediction interval bounds (lower/upper)"
+                        )
+                        st.plotly_chart(fig_bounds, use_container_width=True)
+                
+                    # -----
+                    # 3) Error over time (where it goes wrong)
+                    # -----
+                    with st.expander("Error over time (absolute and % error)", expanded=True):
+                        fig_abs = px.line(
+                            cv.sort_values("ds"),
+                            x="ds",
+                            y="abs_err",
+                            labels={"abs_err": "Absolute error"},
+                            title="CV: Absolute error over time"
+                        )
+                        st.plotly_chart(fig_abs, use_container_width=True)
+                
+                        cv_pct = cv.dropna(subset=["ape"]).copy()
+                        if not cv_pct.empty:
+                            fig_ape = px.line(
+                                cv_pct.sort_values("ds"),
+                                x="ds",
+                                y=cv_pct["ape"] * 100,
+                                labels={"y": "APE (%)"},
+                                title="CV: Percent error (APE) over time"
+                            )
+                            st.plotly_chart(fig_ape, use_container_width=True)
+                
+                    # -----
+                    # 4) Error by horizon bucket (much easier than raw horizons)
+                    # -----
+                    with st.expander("Error by horizon bucket", expanded=True):
+                        # Bucket horizon into friendly ranges
+                        bins = [-np.inf, 7, 14, 30, 60, 90, 120, 180, np.inf]
+                        labels = ["≤7d", "8–14d", "15–30d", "31–60d", "61–90d", "91–120d", "121–180d", "180d+"]
+                        cv["h_bucket"] = pd.cut(cv["horizon_days"], bins=bins, labels=labels)
+                
+                        bucket = cv.groupby("h_bucket", dropna=False).agg(
+                            n=("y", "size"),
+                            mape=("ape", lambda s: float(s.dropna().mean() * 100) if s.notna().any() else np.nan),
+                            median_ape=("ape", lambda s: float(s.dropna().median() * 100) if s.notna().any() else np.nan),
+                            mae=("abs_err", "mean"),
+                            median_abs=("abs_err", "median"),
+                            coverage=("in_80", lambda s: float(s.mean() * 100)),
+                        ).reset_index()
+                
+                        st.dataframe(bucket)
+                
+                        # Bar view: MAPE by bucket
+                        bucket_plot = bucket.dropna(subset=["mape"]).copy()
+                        if not bucket_plot.empty:
+                            fig_bucket = px.bar(
+                                bucket_plot,
+                                x="h_bucket",
+                                y="mape",
+                                labels={"h_bucket": "Horizon bucket", "mape": "MAPE (%)"},
+                                title="CV: Average % error (MAPE) by horizon bucket"
+                            )
+                            st.plotly_chart(fig_bucket, use_container_width=True)
+                
+                    # -----
+                    # 5) Heatmap: error by month-of-year and horizon bucket
+                    # -----
+                    with st.expander("Heatmap: where it fails (month x horizon bucket)", expanded=True):
+                        heat = cv.groupby(["month", "h_bucket"], dropna=False)["ape"].mean().reset_index()
+                        heat["mape_pct"] = heat["ape"] * 100
+                        fig_heat = px.density_heatmap(
+                            heat.dropna(subset=["h_bucket"]),
+                            x="h_bucket",
+                            y="month",
+                            z="mape_pct",
+                            histfunc="avg",
+                            labels={"h_bucket": "Horizon bucket", "month": "Month", "mape_pct": "MAPE (%)"},
+                            title="CV: Avg % error by month-of-year and horizon bucket"
+                        )
+                        st.plotly_chart(fig_heat, use_container_width=True)
+                
+                    # -----
+                    # 6) “Within X%” by horizon bucket (super interpretable)
+                    # -----
+                    with st.expander("Accuracy bands: % of forecasts within ±10% / ±20%", expanded=True):
+                        acc = cv.groupby("h_bucket", dropna=False).agg(
+                            n=("y", "size"),
+                            within_10=("ape", lambda s: float((s <= 0.10).mean() * 100) if s.notna().any() else np.nan),
+                            within_20=("ape", lambda s: float((s <= 0.20).mean() * 100) if s.notna().any() else np.nan),
+                        ).reset_index()
+                
+                        st.dataframe(acc)
+                
+                        acc_long = acc.melt(id_vars=["h_bucket", "n"], value_vars=["within_10", "within_20"],
+                                            var_name="band", value_name="pct")
+                        acc_long["band"] = acc_long["band"].map({"within_10": "Within ±10%", "within_20": "Within ±20%"})
+                
+                        fig_acc = px.line(
+                            acc_long.dropna(subset=["pct"]),
+                            x="h_bucket",
+                            y="pct",
+                            color="band",
+                            markers=True,
+                            labels={"h_bucket": "Horizon bucket", "pct": "% of forecasts"},
+                            title="CV: Share of forecasts within tolerance bands"
+                        )
+                        st.plotly_chart(fig_acc, use_container_width=True)
+                
+                else:
+                    st.info("Backtest views will appear here after CV results are available.")
+
+                
                 # -----------------------
                 # Prepare download ZIP
                 # -----------------------
