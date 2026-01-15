@@ -8,10 +8,14 @@ from plotly.io import to_html
 import zipfile
 import io
 import plotly.express as px
+import hashlib
 
 # ----------------------------
 # Helpers
 # ----------------------------
+def file_hash_bytes(b: bytes) -> str:
+    return hashlib.sha256(b).hexdigest()
+
 def coerce_numeric_allow_blanks(series: pd.Series) -> pd.Series:
     raw = series.astype(str).str.strip()
     raw = raw.str.replace(",", "", regex=False)
@@ -48,7 +52,8 @@ def normalize_backtest_frames(cv_df: pd.DataFrame | None, perf_df: pd.DataFrame 
 
     return cv_df, perf_df
 
-def bt_params_tuple(bt_initial_days, bt_period_days, bt_horizon_days, freq, regressor_cols,
+def bt_params_tuple(bt_initial_days, bt_period_days, bt_horizon_days, freq,
+                    selected_regressors, event_regressors,
                     changepoint_prior_scale, seasonality_prior_scale, manual_changepoints,
                     seasonality_mode, use_log_y):
     return (
@@ -56,7 +61,8 @@ def bt_params_tuple(bt_initial_days, bt_period_days, bt_horizon_days, freq, regr
         int(bt_period_days),
         int(bt_horizon_days),
         str(freq),
-        tuple(regressor_cols),
+        tuple(selected_regressors),
+        tuple(sorted(event_regressors)),
         float(changepoint_prior_scale),
         float(seasonality_prior_scale),
         str(manual_changepoints).strip(),
@@ -65,7 +71,6 @@ def bt_params_tuple(bt_initial_days, bt_period_days, bt_horizon_days, freq, regr
     )
 
 def safe_log1p(y: pd.Series) -> pd.Series:
-    # Handles zeros safely; log1p is nice for SEO series
     return np.log1p(y.clip(lower=0))
 
 def safe_expm1(y: pd.Series) -> pd.Series:
@@ -123,10 +128,6 @@ def render_interpretable_backtest_views(cv_df: pd.DataFrame):
     st.dataframe(bucket)
 
 def compute_baseline_history_view(model: Prophet, hist_df: pd.DataFrame, regressor_cols: list[str], use_log_y: bool):
-    """
-    Returns dataframe with ds, y_actual, baseline(trend), ratio actual/baseline
-    Uses model.predict over history, then takes 'trend' as baseline.
-    """
     pred_in = hist_df[["ds"] + regressor_cols].copy() if regressor_cols else hist_df[["ds"]].copy()
     pred_out = model.predict(pred_in)
 
@@ -135,7 +136,6 @@ def compute_baseline_history_view(model: Prophet, hist_df: pd.DataFrame, regress
         "trend": pred_out["trend"].astype(float),
     })
 
-    # actual in same scale as trained
     out = out.merge(hist_df[["ds", "y"]], on="ds", how="left").rename(columns={"y": "y_model_scale"})
     if use_log_y:
         out["y_actual"] = safe_expm1(out["y_model_scale"])
@@ -147,12 +147,9 @@ def compute_baseline_history_view(model: Prophet, hist_df: pd.DataFrame, regress
     out["ratio_actual_to_baseline"] = out["y_actual"] / out["baseline"].replace(0, np.nan)
     return out.sort_values("ds")
 
-def run_baseline_only_cv(train_df_model_scale: pd.DataFrame, freq: str,
+def run_baseline_only_cv(train_df_model_scale: pd.DataFrame,
                          cps: float, sps: float, seasonality_mode: str,
                          bt_initial_days: int, bt_period_days: int, bt_horizon_days: int):
-    """
-    Baseline-only model: no regressors, same y scale as training df (already log if needed).
-    """
     base_model = Prophet(
         changepoint_prior_scale=cps,
         seasonality_prior_scale=sps,
@@ -179,9 +176,6 @@ def stability_sweep_trends(train_df_model_scale: pd.DataFrame,
                            cps_values: list[float],
                            sps: float, seasonality_mode: str,
                            hist_ds: pd.Series):
-    """
-    Fit baseline-only models with different CPS, return trend curves aligned on hist_ds.
-    """
     curves = []
     for cps in cps_values:
         m = Prophet(
@@ -194,6 +188,16 @@ def stability_sweep_trends(train_df_model_scale: pd.DataFrame,
         curves.append(pd.Series(pred["trend"].astype(float).values, name=str(cps)))
     trend_mat = pd.concat(curves, axis=1)
     return trend_mat
+
+def suggest_event_like(cols: list[str]) -> list[str]:
+    # Heuristic: people often name these like event_, shock_, promo_, campaign_
+    prefixes = ("event", "shock", "promo", "campaign", "update", "algo")
+    out = []
+    for c in cols:
+        lc = c.lower()
+        if any(lc.startswith(p) for p in prefixes) or any(p in lc for p in prefixes):
+            out.append(c)
+    return out
 
 # ----------------------------
 # App
@@ -209,26 +213,22 @@ st.markdown(
 with st.expander("How to use this app"):
     st.markdown("""
     **Step 1. Upload your CSV file**  
-
-    **Step 2. Preview and validate your data**  
-    • Ensures dates parse correctly and numeric columns are numeric.  
-    • Blanks in the metric column are allowed (often future periods).  
-
-    **Step 3. Configure forecasting options (sidebar)**
-
-    **Step 4. Run forecast**
-
-    **Step 5. Backtest + Baseline tests**
+    **Step 2. Pick regressors in the sidebar (no re-upload needed)**  
+    **Step 3. Run forecast**  
+    **Step 4. (Optional) Backtest + Baseline tests**
     """)
 
 # ----------------------------
-# Sidebar config
+# Session init
 # ----------------------------
-st.sidebar.header("Forecast Settings")
-
-# Session state init
 defaults = {
-    "run_forecast": False,
+    "file_hash": None,
+    "data_raw": None,               # original parsed dataframe
+    "cols": None,                   # list of columns
+    "date_col": None,
+    "metric_col": None,
+    "all_regressors": [],
+    # cached results keyed by params
     "bt_cv_df": None,
     "bt_perf_df": None,
     "bt_params": None,
@@ -239,6 +239,11 @@ defaults = {
 for k, v in defaults.items():
     if k not in st.session_state:
         st.session_state[k] = v
+
+# ----------------------------
+# Sidebar config
+# ----------------------------
+st.sidebar.header("Forecast Settings")
 
 with st.sidebar.form("config_form", clear_on_submit=False):
     st.subheader("Target transform")
@@ -283,14 +288,14 @@ with st.sidebar.form("config_form", clear_on_submit=False):
         help="Adds baseline-vs-actual, baseline-only CV, and stability sweep."
     )
     sweep_points = st.selectbox("Baseline stability sweep size", [3, 5, 7], index=1)
-    st.form_submit_button("Apply settings")
+
+    applied = st.form_submit_button("Apply settings")
 
 st.sidebar.divider()
-if st.sidebar.button("Run Forecast", type="primary"):
-    st.session_state.run_forecast = True
+run_clicked = st.sidebar.button("Run Forecast", type="primary")
 
 # ----------------------------
-# File upload
+# File upload + parse once
 # ----------------------------
 uploaded_file = st.file_uploader(
     "Upload your CSV file (first col = date, second col = metric, optional regressors after)",
@@ -301,21 +306,75 @@ if not uploaded_file:
     st.info("Upload a CSV to begin.")
     st.stop()
 
-# ----------------------------
-# Main logic
-# ----------------------------
-try:
-    data = pd.read_csv(uploaded_file)
-    st.write("Uploaded Data Preview:", data.head())
+file_bytes = uploaded_file.getvalue()
+fh = file_hash_bytes(file_bytes)
+
+# New file -> reset dataset-specific state
+if st.session_state.file_hash != fh:
+    st.session_state.file_hash = fh
+    st.session_state.data_raw = None
+    st.session_state.cols = None
+    st.session_state.date_col = None
+    st.session_state.metric_col = None
+    st.session_state.all_regressors = []
+
+    # clear cached computations tied to old data
+    st.session_state.bt_cv_df = None
+    st.session_state.bt_perf_df = None
+    st.session_state.bt_params = None
+    st.session_state.bt_cv_base_df = None
+    st.session_state.bt_perf_base_df = None
+    st.session_state.bt_base_params = None
+
+# Parse data if not already parsed
+if st.session_state.data_raw is None:
+    data = pd.read_csv(io.BytesIO(file_bytes))
+    st.session_state.data_raw = data
+    st.session_state.cols = list(data.columns)
 
     if len(data.columns) < 2:
         st.error("The file must have at least two columns: date + metric.")
         st.stop()
 
-    date_col = data.columns[0]
-    metric_col = data.columns[1]
-    regressor_cols = list(data.columns[2:])
+    st.session_state.date_col = data.columns[0]
+    st.session_state.metric_col = data.columns[1]
+    st.session_state.all_regressors = list(data.columns[2:])
 
+data = st.session_state.data_raw.copy()
+date_col = st.session_state.date_col
+metric_col = st.session_state.metric_col
+all_regressors = st.session_state.all_regressors
+
+st.write("Uploaded Data Preview:", data.head())
+st.info(f"Date column: '{date_col}', Metric column: '{metric_col}'")
+st.info(f"Available regressors: {', '.join(all_regressors) if all_regressors else '(none)'}")
+
+# ----------------------------
+# Regressor selection (no re-upload needed)
+# ----------------------------
+st.sidebar.subheader("Regressors to include")
+selected_regressors = st.sidebar.multiselect(
+    "Select regressors for this run",
+    options=all_regressors,
+    default=st.session_state.get("selected_regressors", all_regressors),
+    help="Pick which columns Prophet should use as regressors for this run."
+)
+st.session_state.selected_regressors = selected_regressors
+
+suggested_events = [c for c in suggest_event_like(selected_regressors)]
+st.sidebar.subheader("Event/shock regressors")
+event_regressors = st.sidebar.multiselect(
+    "Treat these as event flags (future defaults to 0)",
+    options=selected_regressors,
+    default=st.session_state.get("event_regressors", suggested_events),
+    help="Event flags should NOT be carried into the future. They default to 0 for future dates."
+)
+st.session_state.event_regressors = event_regressors
+
+# ----------------------------
+# Validate + coerce types
+# ----------------------------
+try:
     data[date_col] = pd.to_datetime(data[date_col], errors="coerce")
     if data[date_col].isna().any():
         st.error(f"Invalid dates detected in column '{date_col}'.")
@@ -328,7 +387,7 @@ try:
         st.stop()
     data[metric_col] = metric_coerced
 
-    for reg_col in regressor_cols:
+    for reg_col in selected_regressors:
         reg_coerced = coerce_numeric_allow_blanks(data[reg_col])
         bad_reg = find_true_non_numeric_examples(data[reg_col], reg_coerced)
         if bad_reg:
@@ -336,16 +395,28 @@ try:
             st.stop()
         data[reg_col] = reg_coerced
 
-    st.info(f"Date column: '{date_col}', Metric column: '{metric_col}'")
-    st.info(f"Regressors: {', '.join(regressor_cols) if regressor_cols else '(none)'}")
+except Exception as e:
+    st.error(f"Failed to validate/coerce the uploaded file: {e}")
+    st.stop()
 
+# ----------------------------
+# Only run heavy work on button click
+# ----------------------------
+if not run_clicked:
+    st.info("Pick regressors in the sidebar, then click **Run Forecast**.")
+    st.stop()
+
+# ----------------------------
+# Main logic
+# ----------------------------
+try:
     df = data.rename(columns={date_col: "ds", metric_col: "y_raw"}).copy()
     df = df.sort_values("ds").reset_index(drop=True)
 
     # Apply target transform (model scale)
     df["y"] = safe_log1p(df["y_raw"]) if use_log_y else df["y_raw"]
 
-    # Frequency
+    # Resolve frequency
     if freq_choice == "Infer Automatically":
         inferred = pd.infer_freq(df["ds"])
         if inferred:
@@ -358,25 +429,20 @@ try:
         freq_map = {"Daily": "D", "Weekly": "W", "Monthly": "M", "Yearly": "Y"}
         freq = freq_map[freq_choice]
 
-    st.write("Processed Data (pre-resample):", df[["ds", "y_raw", "y"] + regressor_cols].head())
-
-    if not st.session_state.run_forecast:
-        st.info("Configure options in the sidebar, then click **Run Forecast**.")
-        st.stop()
+    st.write("Processed Data (pre-resample):", df[["ds", "y_raw", "y"] + selected_regressors].head())
 
     with st.spinner("Running forecast..."):
         # Resample
         df = df.set_index("ds").asfreq(freq).reset_index()
 
-        # Fill regressors after resampling
-        if regressor_cols:
-            for reg_col in regressor_cols:
-                if reg_col in df.columns and df[reg_col].isna().any():
-                    st.warning(
-                        f"Regressor '{reg_col}' has missing values after resampling. "
-                        f"Forward/back-filling so Prophet can run."
-                    )
-                    df[reg_col] = df[reg_col].ffill().bfill()
+        # Fill regressors after resampling (only selected ones)
+        for reg_col in selected_regressors:
+            if reg_col in df.columns and df[reg_col].isna().any():
+                st.warning(
+                    f"Regressor '{reg_col}' has missing values after resampling. "
+                    f"Forward/back-filling so Prophet can run."
+                )
+                df[reg_col] = df[reg_col].ffill().bfill()
 
         # Split train vs future blanks (based on raw y)
         train_df = df[df["y_raw"].notna()].copy()
@@ -386,14 +452,14 @@ try:
             st.error("No historical (non-null) metric values found to train on.")
             st.stop()
 
-        # Model with regressors (main)
+        # Build model
         model = Prophet(
             changepoint_prior_scale=changepoint_prior_scale,
             seasonality_prior_scale=seasonality_prior_scale,
             seasonality_mode=seasonality_mode,
         )
 
-        for reg_col in regressor_cols:
+        for reg_col in selected_regressors:
             model.add_regressor(reg_col)
 
         if manual_changepoints.strip():
@@ -401,17 +467,26 @@ try:
             model.changepoints = cps
             st.write("Using manual changepoints:", cps)
 
-        model.fit(train_df[["ds", "y"] + regressor_cols])
+        model.fit(train_df[["ds", "y"] + selected_regressors])
 
-        # Future dataframe for prediction
+        # Build future
         if not missing_future_df.empty:
-            future = missing_future_df[["ds"] + regressor_cols].copy()
+            future = missing_future_df[["ds"] + selected_regressors].copy()
             st.info(f"Detected {len(missing_future_df)} blank metric rows. Forecasting those dates from your file.")
         else:
             future = model.make_future_dataframe(periods=int(forecast_periods), freq=freq)
-            for reg_col in regressor_cols:
-                last_val = train_df[reg_col].dropna().iloc[-1] if train_df[reg_col].notna().any() else 0.0
-                future[reg_col] = last_val
+
+            # Fill regressors into future: event flags -> 0, others -> carry last observed
+            for reg_col in selected_regressors:
+                if reg_col in event_regressors:
+                    future[reg_col] = 0.0
+                else:
+                    last_val = (
+                        train_df[reg_col].dropna().iloc[-1]
+                        if reg_col in train_df.columns and train_df[reg_col].notna().any()
+                        else 0.0
+                    )
+                    future[reg_col] = float(last_val)
 
         forecast = model.predict(future)
 
@@ -430,7 +505,13 @@ try:
 
         # Combine history + predictions for matrix, using raw scale
         hist = df[["ds", "y_raw"]].copy()
-        combined = pd.merge(hist, pred[["ds", "yhat_raw", "yhat_lower_raw", "yhat_upper_raw"]], on="ds", how="outer").sort_values("ds")
+        combined = pd.merge(
+            hist,
+            pred[["ds", "yhat_raw", "yhat_lower_raw", "yhat_upper_raw"]],
+            on="ds",
+            how="outer"
+        ).sort_values("ds")
+
         combined["final"] = combined["y_raw"].combine_first(combined["yhat_raw"])
         combined["year"] = combined["ds"].dt.year
         combined["month"] = combined["ds"].dt.month
@@ -447,8 +528,10 @@ try:
         st.write("Year-on-Year Comparison Line Chart:")
         plot_mat = matrix.drop(columns=["% Change"], errors="ignore")
         yoy = plot_mat.reset_index().melt(id_vars="month", var_name="year", value_name="value")
-        fig_yoy = px.line(yoy, x="month", y="value", color="year",
-                          labels={"month": "Month", "value": "Metric"})
+        fig_yoy = px.line(
+            yoy, x="month", y="value", color="year",
+            labels={"month": "Month", "value": "Metric"}
+        )
         st.plotly_chart(fig_yoy, use_container_width=True)
 
         st.write("Forecast Plot:")
@@ -470,7 +553,8 @@ try:
 
             current_params = bt_params_tuple(
                 bt_initial_days, bt_period_days, bt_horizon_days,
-                freq, regressor_cols,
+                freq,
+                selected_regressors, event_regressors,
                 changepoint_prior_scale, seasonality_prior_scale, manual_changepoints,
                 seasonality_mode, use_log_y
             )
@@ -540,9 +624,13 @@ try:
                 "These tests treat baseline as the model trend. If baseline is unstable here, it will be unreliable in planning."
             )
 
-            # 1) Baseline vs Actual (history)
             st.subheader("Baseline vs Actual (history)")
-            baseline_hist = compute_baseline_history_view(model, train_df[["ds", "y"] + regressor_cols], regressor_cols, use_log_y)
+            baseline_hist = compute_baseline_history_view(
+                model,
+                train_df[["ds", "y"] + selected_regressors],
+                selected_regressors,
+                use_log_y
+            )
             st.dataframe(baseline_hist.head(30))
 
             fig_base = px.line(
@@ -563,13 +651,14 @@ try:
             )
             st.plotly_chart(fig_ratio, use_container_width=True)
 
-            # 2) Baseline-only CV (no regressors)
+            # Baseline-only CV (no regressors)
             if run_backtest:
                 st.subheader("Baseline-only backtest (no regressors)")
 
                 base_params = (
-                    bt_initial_days, bt_period_days, bt_horizon_days, freq,
-                    changepoint_prior_scale, seasonality_prior_scale, seasonality_mode, use_log_y
+                    int(bt_initial_days), int(bt_period_days), int(bt_horizon_days),
+                    float(changepoint_prior_scale), float(seasonality_prior_scale),
+                    str(seasonality_mode), bool(use_log_y)
                 )
                 recompute_base = (
                     st.session_state.bt_cv_base_df is None
@@ -586,7 +675,6 @@ try:
                     with st.spinner("Running baseline-only CV (no regressors)..."):
                         base_model, cv_base, perf_base = run_baseline_only_cv(
                             train_df_model_scale=train_df[["ds", "y"]],
-                            freq=freq,
                             cps=changepoint_prior_scale,
                             sps=seasonality_prior_scale,
                             seasonality_mode=seasonality_mode,
@@ -610,32 +698,8 @@ try:
                     with st.expander("Baseline-only performance metrics"):
                         st.dataframe(perf_base)
 
-                    # If on log scale, convert CV outputs to raw for interpretability
-                    cvb = cv_base.copy()
-                    if use_log_y:
-                        # cv outputs are in model scale; convert y and yhat back
-                        for col in ["y", "yhat", "yhat_lower", "yhat_upper"]:
-                            if col in cvb.columns:
-                                cvb[col + "_raw"] = safe_expm1(cvb[col].astype(float))
-                        y_col = "y_raw" if "y_raw" in cvb.columns else "y"
-                        yhat_col = "yhat_raw" if "yhat_raw" in cvb.columns else "yhat"
-                    else:
-                        y_col = "y"
-                        yhat_col = "yhat"
-
-                    cvb["abs_err_raw"] = (cvb[y_col] - cvb[yhat_col]).abs()
-                    fig_cvb = px.line(
-                        cvb.sort_values("ds"),
-                        x="ds",
-                        y="abs_err_raw",
-                        labels={"abs_err_raw": "Absolute error"},
-                        title="Baseline-only CV: absolute error over time"
-                    )
-                    st.plotly_chart(fig_cvb, use_container_width=True)
-
-            # 3) Stability sweep (trend sensitivity to CPS)
+            # Baseline stability sweep (trend sensitivity to CPS)
             st.subheader("Baseline stability sweep (trend sensitivity)")
-            # choose cps values around current CPS
             base = float(changepoint_prior_scale)
             if sweep_points == 3:
                 cps_values = sorted({max(0.001, base * 0.5), base, min(1.0, base * 2.0)})
@@ -668,11 +732,9 @@ try:
             )
             trend_mean = trend_mat.mean(axis=1)
             trend_std = trend_mat.std(axis=1)
-            # Stability score: median coefficient of variation of trend (lower is more stable)
             denom = trend_mean.replace(0, np.nan).abs()
             stability_cv = (trend_std / denom).replace([np.inf, -np.inf], np.nan)
             stability_score = float(np.nanmedian(stability_cv.values))
-
             st.metric("Baseline stability score (median CV of trend)", f"{stability_score:.4f}")
 
             # Convert to raw scale if log used
@@ -680,14 +742,11 @@ try:
                 plot_df = pd.DataFrame({"ds": hist_ds})
                 for col in trend_mat.columns:
                     plot_df[f"trend_cps_{col}"] = safe_expm1(trend_mat[col].astype(float).values)
-                plot_df["trend_mean"] = safe_expm1(trend_mean.astype(float).values)
             else:
                 plot_df = pd.DataFrame({"ds": hist_ds})
                 for col in trend_mat.columns:
                     plot_df[f"trend_cps_{col}"] = trend_mat[col].astype(float).values
-                plot_df["trend_mean"] = trend_mean.astype(float).values
 
-            # Long format for plotting multiple lines
             line_cols = [c for c in plot_df.columns if c.startswith("trend_cps_")]
             long_trend = plot_df.melt(id_vars="ds", value_vars=line_cols, var_name="variant", value_name="baseline")
             long_trend["variant"] = long_trend["variant"].str.replace("trend_cps_", "CPS=")
@@ -706,7 +765,6 @@ try:
         # -----------------------
         buffer = io.BytesIO()
         with zipfile.ZipFile(buffer, "w") as zf:
-            # core outputs
             csv_combined = io.StringIO()
             combined.to_csv(csv_combined, index=False)
             zf.writestr("combined_data.csv", csv_combined.getvalue())
@@ -719,7 +777,6 @@ try:
             zf.writestr("forecast.html", to_html(fig_forecast, full_html=True, include_plotlyjs="cdn"))
             zf.writestr("components.html", to_html(fig_decomp, full_html=True, include_plotlyjs="cdn"))
 
-            # backtest exports
             if run_backtest and cv_df is not None and perf_df is not None:
                 csv_cv = io.StringIO()
                 cv_df.to_csv(csv_cv, index=False)
@@ -729,7 +786,6 @@ try:
                 perf_df.to_csv(csv_perf, index=False)
                 zf.writestr("backtest_performance_metrics.csv", csv_perf.getvalue())
 
-            # baseline-only cv exports
             if run_baseline_tests and run_backtest:
                 cv_base = st.session_state.bt_cv_base_df
                 perf_base = st.session_state.bt_perf_base_df
@@ -750,9 +806,6 @@ try:
             file_name="forecast_results.zip",
             mime="application/zip",
         )
-
-    # prevent accidental reruns
-    st.session_state.run_forecast = False
 
 except Exception as e:
     st.error(f"Failed to process the uploaded file: {e}")
